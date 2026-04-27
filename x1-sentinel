@@ -12,11 +12,11 @@
 #    ./x1-precog-sentinel.sh --discover [s]   # list metric names emitted by node
 #    ./x1-precog-sentinel.sh --alerts         # quiet, alert on risk transitions
 #
-#  Config (env or /home/owl1/bin/sentinel.conf or /home/owl1/bin/sentinel-telegram.conf):
-#    IDENTITY      path to identity keypair      (default /home/owl1/.config/solana/identity.json)
+#  Config (env or /home/user/bin/sentinel.conf or /home/user/bin/sentinel-telegram.conf):
+#    IDENTITY      path to identity keypair      (default /home/user/.config/solana/identity.json)
 #    SERVICE       systemd unit name             (default: auto-detect)
 #    RPC_URL       local RPC                     (default http://localhost:8899)
-#    CLUSTER_RPC   cluster RPC for drift compare (default https://rpc.testnet.x1.xyz)
+#    CLUSTER_RPC   cluster RPC for drift compare (default https://rpc.mainnet.x1.xyz)
 #    NVME_DEV      e.g. nvme0n1                  (default: auto-detect)
 #    BUDGET_MS     slot budget in ms             (default 400)
 #    REFRESH       dashboard tick seconds        (default 1)
@@ -46,8 +46,8 @@ else
         "$HOME/.config/sentinel.conf" \
         "$HOME/sentinel.conf" \
         /etc/x1-sentinel/sentinel.conf \
-        /home/owl1/bin/sentinel.conf \
-        /home/owl1/bin/sentinel-telegram.conf \
+        /home/user/bin/sentinel.conf \
+        /home/user/bin/sentinel-telegram.conf \
         /etc/sentinel.conf; do
         if [[ -f "$conf" ]]; then
             # shellcheck disable=SC1090
@@ -69,13 +69,13 @@ for alib in \
     fi
 done
 
-IDENTITY="${IDENTITY:-/home/owl1/.config/solana/identity.json}"
+IDENTITY="${IDENTITY:-/home/user/.config/solana/identity.json}"
 [[ "${SERVICE:-}" == "auto-detect" ]] && SERVICE=""
 SERVICE="${SERVICE:-$(systemctl list-units --type=service --state=running 2>/dev/null \
     | awk '/(solana|tachyon|agave|x1).*\.service/ {print $1; exit}')}"
 SERVICE="${SERVICE:-tachyon-validator.service}"
 RPC_URL="${RPC_URL:-http://localhost:8899}"
-CLUSTER_RPC="${CLUSTER_RPC:-https://rpc.testnet.x1.xyz}"
+CLUSTER_RPC="${CLUSTER_RPC:-https://rpc.mainnet.x1.xyz}"
 BUDGET_MS="${BUDGET_MS:-400}"
 REFRESH="${REFRESH:-1}"
 [[ "${NVME_DEV:-}" == "auto-detect" ]] && NVME_DEV=""
