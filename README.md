@@ -29,6 +29,7 @@ Features:
 ```bash
 git clone https://github.com/Commoneffort/x1-sentinel.git
 cd x1-sentinel
+chmod +x x1-sentinel
 ./install.sh
 ```
 
