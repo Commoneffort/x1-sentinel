@@ -1,0 +1,22 @@
+[Unit]
+Description=x1-sentinel — precognitive validator monitoring (daemon mode)
+Documentation=https://github.com/Commoneffort/x1-sentinel
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=@BIN@ --alerts
+Environment=SENTINEL_CONFIG=@CONFIG@
+Restart=on-failure
+RestartSec=10s
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+ReadWritePaths=/dev/shm
+
+[Install]
+WantedBy=default.target

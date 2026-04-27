@@ -1,0 +1,2684 @@
+#!/usr/bin/env bash
+# =============================================================================
+#  X1 PRECOGNITIVE SENTINEL v11
+#  Full-pipeline early-warning monitor for Tachyon / X1 / Agave validators.
+#
+#    Pipeline watched:  TPU → SigVerify → Banking → PoH → Broadcast
+#    Plus:              AccountsDB, system (CPU/NVMe/RAM), RPC freshness drift
+#
+#  Modes:
+#    ./x1-precog-sentinel.sh                  # live multi-panel dashboard
+#    ./x1-precog-sentinel.sh --stream         # raw event stream (v10 behavior)
+#    ./x1-precog-sentinel.sh --discover [s]   # list metric names emitted by node
+#    ./x1-precog-sentinel.sh --alerts         # quiet, alert on risk transitions
+#
+#  Config (env or /home/owl1/bin/sentinel.conf or /home/owl1/bin/sentinel-telegram.conf):
+#    IDENTITY      path to identity keypair      (default /home/owl1/.config/solana/identity.json)
+#    SERVICE       systemd unit name             (default: auto-detect)
+#    RPC_URL       local RPC                     (default http://localhost:8899)
+#    CLUSTER_RPC   cluster RPC for drift compare (default https://rpc.testnet.x1.xyz)
+#    NVME_DEV      e.g. nvme0n1                  (default: auto-detect)
+#    BUDGET_MS     slot budget in ms             (default 400)
+#    REFRESH       dashboard tick seconds        (default 1)
+#    TG_TOKEN/TG_CHAT optional telegram alerts
+# =============================================================================
+
+set -o pipefail
+shopt -s extglob
+
+# ------------------------------------------------------------- config loading
+# Search multiple locations so it works regardless of which user runs it
+# and which directory contains the script.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONF_LOADED=""
+
+# Allow $SENTINEL_CONFIG to override search entirely (used by systemd unit)
+if [[ -n "${SENTINEL_CONFIG:-}" && -f "$SENTINEL_CONFIG" ]]; then
+    # shellcheck disable=SC1090
+    source "$SENTINEL_CONFIG"
+    CONF_LOADED="$SENTINEL_CONFIG"
+else
+    for conf in \
+        "$SCRIPT_DIR/sentinel.conf" \
+        "$SCRIPT_DIR/sentinel-telegram.conf" \
+        "$HOME/.config/x1-sentinel/sentinel.conf" \
+        "$HOME/edgeguard/sentinel.conf" \
+        "$HOME/.config/sentinel.conf" \
+        "$HOME/sentinel.conf" \
+        /etc/x1-sentinel/sentinel.conf \
+        /home/owl1/bin/sentinel.conf \
+        /home/owl1/bin/sentinel-telegram.conf \
+        /etc/sentinel.conf; do
+        if [[ -f "$conf" ]]; then
+            # shellcheck disable=SC1090
+            source "$conf"
+            CONF_LOADED="${CONF_LOADED}${conf}; "
+        fi
+    done
+fi
+
+# Source alert library if installed alongside
+for alib in \
+    "$SCRIPT_DIR/lib/alert.sh" \
+    "$HOME/.local/share/x1-sentinel/lib/alert.sh" \
+    /usr/local/share/x1-sentinel/lib/alert.sh; do
+    if [[ -f "$alib" ]]; then
+        # shellcheck disable=SC1090
+        source "$alib"
+        break
+    fi
+done
+
+IDENTITY="${IDENTITY:-/home/owl1/.config/solana/identity.json}"
+[[ "${SERVICE:-}" == "auto-detect" ]] && SERVICE=""
+SERVICE="${SERVICE:-$(systemctl list-units --type=service --state=running 2>/dev/null \
+    | awk '/(solana|tachyon|agave|x1).*\.service/ {print $1; exit}')}"
+SERVICE="${SERVICE:-tachyon-validator.service}"
+RPC_URL="${RPC_URL:-http://localhost:8899}"
+CLUSTER_RPC="${CLUSTER_RPC:-https://rpc.testnet.x1.xyz}"
+BUDGET_MS="${BUDGET_MS:-400}"
+REFRESH="${REFRESH:-1}"
+[[ "${NVME_DEV:-}" == "auto-detect" ]] && NVME_DEV=""
+# Prefer the device the rootfs/ledger lives on; fall back to first nvme disk
+if [[ -z "${NVME_DEV:-}" ]]; then
+    # find device backing root mount
+    NVME_DEV=$(findmnt -no SOURCE / 2>/dev/null | sed 's|^/dev/||' | head -1)
+fi
+NVME_DEV="${NVME_DEV:-$(lsblk -ndo NAME,TYPE 2>/dev/null \
+    | awk '$2=="disk" && $1 ~ /^nvme/ {print $1; exit}')}"
+NVME_DEV="${NVME_DEV:-nvme0n1}"
+
+# PUBKEY can be set directly to bypass solana-keygen (handy for cross-user identity files)
+if [[ -n "${PUBKEY:-}" ]]; then
+    MY_PUBKEY="$PUBKEY"
+else
+    # Try the configured IDENTITY first
+    MY_PUBKEY=$(solana-keygen pubkey "$IDENTITY" 2>/dev/null || echo "")
+    # Fall back to common locations if that didn't work
+    if [[ -z "$MY_PUBKEY" || "$MY_PUBKEY" == "unknown" ]]; then
+        for cand in \
+            "$HOME/.config/solana/identity.json" \
+            "/root/.config/solana/identity.json" \
+            "/home/sol/.config/solana/identity.json" \
+            "/home/solana/.config/solana/identity.json" \
+            "$HOME/validator-keypair.json"; do
+            if [[ -r "$cand" ]]; then
+                MY_PUBKEY=$(solana-keygen pubkey "$cand" 2>/dev/null || echo "")
+                [[ -n "$MY_PUBKEY" ]] && { IDENTITY="$cand"; break; }
+            fi
+        done
+        # Probe other users' home dirs (read-permitted only)
+        if [[ -z "$MY_PUBKEY" ]]; then
+            for d in /home/*/.config/solana/identity.json; do
+                if [[ -r "$d" ]]; then
+                    MY_PUBKEY=$(solana-keygen pubkey "$d" 2>/dev/null || echo "")
+                    [[ -n "$MY_PUBKEY" ]] && { IDENTITY="$d"; break; }
+                fi
+            done
+        fi
+    fi
+    [[ -z "$MY_PUBKEY" ]] && MY_PUBKEY="unknown"
+fi
+HOST=$(hostname -s)
+NCPU=$(nproc 2>/dev/null || echo 1)
+
+STATE_DIR="$(mktemp -d -p /dev/shm sentinel.XXXXXX 2>/dev/null || mktemp -d)"
+declare -a BG_PIDS=()
+
+# ------------------------------------------------------------- colors / glyphs
+C_RST=$'\033[0m';   C_DIM=$'\033[2m';   C_BLD=$'\033[1m'
+C_RED=$'\033[1;31m'; C_YEL=$'\033[1;33m'; C_GRN=$'\033[1;32m'
+C_CYN=$'\033[1;36m'; C_MAG=$'\033[1;35m'; C_BLU=$'\033[1;34m'
+C_GRY=$'\033[0;37m'; C_WHT=$'\033[1;37m'
+
+# ------------------------------------------------------------- splash screen
+# Shown on dashboard launch. Persists until user presses Enter.
+show_splash() {
+    clear
+    local splash_file=""
+    for cand in \
+        "$SCRIPT_DIR/lib/splash.txt" \
+        "$HOME/.local/share/x1-sentinel/lib/splash.txt" \
+        "/usr/local/share/x1-sentinel/lib/splash.txt"; do
+        if [[ -f "$cand" ]]; then splash_file="$cand"; break; fi
+    done
+
+    # Get terminal dimensions for centering
+    local term_w=80 term_h=24
+    if command -v tput >/dev/null 2>&1; then
+        term_w=$(tput cols  2>/dev/null || echo 80)
+        term_h=$(tput lines 2>/dev/null || echo 24)
+    fi
+
+    # Vertical padding to push content toward middle
+    # Splash art is ~62 lines, banner ~7 lines, credits ~3 lines = ~75 lines
+    local content_h=78
+    local v_pad=$(( (term_h - content_h) / 2 ))
+    (( v_pad < 0 )) && v_pad=0
+
+    # Helper to print a line centered in the terminal width
+    center() {
+        local line="$1" color="${2:-}"
+        # Strip color codes for length calc
+        local plain="${line//$'\033'\[*([0-9;])m/}"
+        local len=${#plain}
+        local pad=$(( (term_w - len) / 2 ))
+        (( pad < 0 )) && pad=0
+        printf '%*s%b%s%b\n' "$pad" "" "$color" "$line" "$C_RST"
+    }
+
+    local i; for ((i=0; i<v_pad; i++)); do echo; done
+
+    # Render the capybara art centered. Each line of the art is ~134 chars wide,
+    # so on narrower terminals we just print left-aligned dim.
+    if [[ -n "$splash_file" ]]; then
+        if (( term_w >= 140 )); then
+            local art_w=134
+            local art_pad=$(( (term_w - art_w) / 2 ))
+            (( art_pad < 0 )) && art_pad=0
+            while IFS= read -r line; do
+                printf '%*s%b%s%b\n' "$art_pad" "" "$C_DIM$C_CYN" "$line" "$C_RST"
+            done < "$splash_file"
+        else
+            # Narrow terminal: skip art, just show banner
+            printf '%b' "$C_DIM"
+            cat "$splash_file"
+            printf '%b\n' "$C_RST"
+        fi
+    fi
+
+    echo
+    # Big block-letter CAPYBARA banner — 7 lines tall
+    printf '%b' "$C_BLD$C_CYN"
+    local banner=(
+"   ██████╗ █████╗ ██████╗ ██╗   ██╗██████╗  █████╗ ██████╗  █████╗ "
+"  ██╔════╝██╔══██╗██╔══██╗╚██╗ ██╔╝██╔══██╗██╔══██╗██╔══██╗██╔══██╗"
+"  ██║     ███████║██████╔╝ ╚████╔╝ ██████╔╝███████║██████╔╝███████║"
+"  ██║     ██╔══██║██╔═══╝   ╚██╔╝  ██╔══██╗██╔══██║██╔══██╗██╔══██║"
+"  ╚██████╗██║  ██║██║        ██║   ██████╔╝██║  ██║██║  ██║██║  ██║"
+"   ╚═════╝╚═╝  ╚═╝╚═╝        ╚═╝   ╚═════╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝"
+    )
+    local banner_w=68
+    local banner_pad=$(( (term_w - banner_w) / 2 ))
+    (( banner_pad < 0 )) && banner_pad=0
+    for line in "${banner[@]}"; do
+        printf '%*s%s\n' "$banner_pad" "" "$line"
+    done
+    printf '%b' "$C_RST"
+
+    echo
+    center "X1 validator sentinel · v0.2"            "$C_DIM"
+    center "precognitive monitoring for X1 mainnet"  "$C_DIM"
+    echo
+    center "made by Owl of Atena"                    "$C_CYN"
+    echo
+    echo
+    center "press ENTER to begin"                    "$C_BLD"
+
+    # Wait for Enter (or any line input)
+    read -r _ </dev/tty 2>/dev/null || sleep 2
+    clear
+}
+# Panel width and consistent column positions
+PANEL_W=68
+RAIL="│"
+TOP_L="╭"; TOP_R="╮"; BOT_L="╰"; BOT_R="╯"; HZ="─"
+
+# Help mode toggle (cycled with '?'). When ON, every panel shows inline help.
+HELP_MODE="${HELP_MODE:-0}"
+# Per-panel help expansion: key = panel name, value = 1 if expanded
+declare -A HELP_EXPANDED
+
+# status_for_value <value> <warn_thr> <crit_thr> [reverse]
+# Returns one of: ok|warn|crit|idle
+# If reverse=1, lower is worse (e.g. tick rate where 188 is good and 100 is bad)
+status_for_value() {
+    local v="$1" warn="$2" crit="$3" reverse="${4:-0}"
+    [[ -z "$v" || "$v" == "0" || "$v" == "0.0" ]] && { echo "idle"; return; }
+    if [[ "$reverse" == "1" ]]; then
+        awk -v v="$v" -v c="$crit" 'BEGIN{exit !(v < c)}' && { echo "crit"; return; }
+        awk -v v="$v" -v w="$warn" 'BEGIN{exit !(v < w)}' && { echo "warn"; return; }
+    else
+        awk -v v="$v" -v c="$crit" 'BEGIN{exit !(v > c)}' && { echo "crit"; return; }
+        awk -v v="$v" -v w="$warn" 'BEGIN{exit !(v > w)}' && { echo "warn"; return; }
+    fi
+    echo "ok"
+}
+
+# color_for_status <status>
+color_for_status() {
+    case "$1" in
+        ok)   echo "$C_GRN" ;;
+        warn) echo "$C_YEL" ;;
+        crit) echo "$C_RED" ;;
+        idle) echo "$C_DIM" ;;
+        *)    echo "$C_RST" ;;
+    esac
+}
+
+# badge <status>  -> [OK] / [WARN] / [CRIT] / [idle] colored
+badge() {
+    local s="$1" c
+    c=$(color_for_status "$s")
+    case "$s" in
+        ok)   printf '%b[OK]%b'    "$c" "$C_RST" ;;
+        warn) printf '%b[WARN]%b'  "$c" "$C_RST" ;;
+        crit) printf '%b[CRIT]%b'  "$c" "$C_RST" ;;
+        idle) printf '%b[idle]%b'  "$c" "$C_RST" ;;
+        *)    printf '%b[?]%b'     "$C_DIM" "$C_RST" ;;
+    esac
+}
+
+# sparkline <space-separated values> [warn_thr] [crit_thr] [reverse]
+# Renders a 20-cell unicode sparkline colored by value vs thresholds.
+sparkline() {
+    local values="$1" warn="${2:-}" crit="${3:-}" reverse="${4:-0}"
+    [[ -z "$values" ]] && { printf '%b────────────────────%b' "$C_DIM" "$C_RST"; return; }
+
+    awk -v vals="$values" -v warn="$warn" -v crit="$crit" -v rev="$reverse" \
+        -v cgrn="$C_GRN" -v cyel="$C_YEL" -v cred="$C_RED" -v cdim="$C_DIM" -v crst="$C_RST" '
+    BEGIN {
+        n = split(vals, v, " ")
+        if (n == 0) { printf "%s────────────────────%s", cdim, crst; exit }
+        start = (n > 20) ? n - 19 : 1
+        mn = v[start]; mx = v[start]
+        for (i = start; i <= n; i++) {
+            if (v[i] == "") continue
+            if (v[i] < mn) mn = v[i]
+            if (v[i] > mx) mx = v[i]
+        }
+        range = mx - mn
+        if (range == 0) range = 1
+        glyphs = "▁▂▃▄▅▆▇█"
+        for (i = start; i <= n; i++) {
+            x = (v[i] - mn) / range
+            idx = int(x * 7) + 1
+            if (idx < 1) idx = 1; if (idx > 8) idx = 8
+            ch = substr(glyphs, idx, 1)
+            color = cgrn
+            if (warn != "" && crit != "") {
+                if (rev == "1") {
+                    if (v[i] < crit+0) color = cred
+                    else if (v[i] < warn+0) color = cyel
+                } else {
+                    if (v[i] > crit+0) color = cred
+                    else if (v[i] > warn+0) color = cyel
+                }
+            }
+            printf "%s%s", color, ch
+        }
+        for (i = n - start + 1; i < 20; i++) printf "%s▁", cdim
+        printf "%s", crst
+    }'
+}
+
+# header_line <name> <status> <sparkline> <suffix>
+# Renders the top of a panel: ╭─ NAME  ● STATUS  sparkline  · suffix
+panel_header() {
+    local name="$1" status="$2" spark="$3" suffix="${4:-}"
+    local rail_color status_color
+    rail_color=$(color_for_status "$status")
+    status_color="$rail_color"
+    local status_text
+    case "$status" in
+        ok)   status_text="● HEALTHY"  ;;
+        warn) status_text="● WARNING"  ;;
+        crit) status_text="● CRITICAL" ;;
+        idle) status_text="○ idle"     ;;
+        *)    status_text="○ ?"        ;;
+    esac
+    printf '%b%s%s%b %b%s%b  %b%s%b  %s' \
+        "$rail_color" "$TOP_L" "$HZ" "$C_RST" \
+        "$C_BLD$C_CYN" "$name" "$C_RST" \
+        "$status_color" "$status_text" "$C_RST" \
+        "$spark"
+    [[ -n "$suffix" ]] && printf ' %b· %s%b' "$C_DIM" "$suffix" "$C_RST"
+    printf '\n'
+}
+
+# panel_row <rail_color> <label> <value> <unit> <status> <description>
+# A neatly aligned row inside a panel.
+panel_row() {
+    local rail_color="$1" label="$2" value="$3" unit="$4" status="$5" desc="$6"
+    local val_color
+    val_color=$(color_for_status "$status")
+    # idle values dim everything including label
+    if [[ "$status" == "idle" ]]; then
+        printf '%b%s%b  %b%-13s%b %b%7s%b %-3s   %s   %b%s%b\n' \
+            "$rail_color" "$RAIL" "$C_RST" \
+            "$C_DIM" "$label" "$C_RST" \
+            "$C_DIM" "$value" "$C_RST" "$unit" \
+            "$(badge "$status")" \
+            "$C_DIM" "$desc" "$C_RST"
+    else
+        printf '%b%s%b  %-13s %b%7s%b %-3s   %s   %b%s%b\n' \
+            "$rail_color" "$RAIL" "$C_RST" \
+            "$label" \
+            "$C_BLD$val_color" "$value" "$C_RST" "$unit" \
+            "$(badge "$status")" \
+            "$C_DIM" "$desc" "$C_RST"
+    fi
+}
+
+# panel_text <rail_color> <text>  -- arbitrary text row
+panel_text() {
+    local rail_color="$1" text="$2"
+    printf '%b%s%b  %s\n' "$rail_color" "$RAIL" "$C_RST" "$text"
+}
+
+# panel_help <rail_color> <key> <description-block>
+# If HELP_MODE is on or the panel's help is expanded, prints the help block.
+panel_help() {
+    local rail_color="$1" panel_key="$2" desc="$3"
+    if [[ "$HELP_MODE" == "1" || "${HELP_EXPANDED[$panel_key]:-0}" == "1" ]]; then
+        local IFS=$'\n'
+        printf '%b%s%b\n' "$rail_color" "$RAIL" "$C_RST"
+        for line in $desc; do
+            printf '%b%s%b  %b%s%b\n' \
+                "$rail_color" "$RAIL" "$C_RST" \
+                "$C_CYN" "$line" "$C_RST"
+        done
+    fi
+}
+
+# panel_footer <rail_color>
+panel_footer() {
+    local rail_color="$1"
+    printf '%b%s%b %bpress ? for help · h to toggle inline%b\n' \
+        "$rail_color" "$BOT_L$HZ" "$C_RST" \
+        "$C_DIM" "$C_RST"
+}
+
+# Read recent values from a state file column for a sparkline (last 20)
+spark_values() {
+    local file="$1" col="${2:-1}" win="${3:-60}"
+    [[ ! -s "$file" ]] && { echo ""; return; }
+    awk -v now="$(date +%s.%3N)" -v win="$win" -v c="$col" '
+        { if (now-$1 <= win) vals[++n] = $(c+1) }
+        END {
+            if (n == 0) exit
+            step = (n > 20) ? n/20 : 1
+            for (i = 1; i <= 20 && i*step <= n; i++) {
+                idx = int((i-1)*step) + 1
+                printf "%s ", vals[idx]
+            }
+        }' "$file"
+}
+
+# render_two_columns <fn1> <fn2>  → prints fn1 and fn2 output side-by-side
+# Each panel is captured into a temp string, then lines are paired and printed.
+# Uses ~half the terminal width per column.
+render_two_columns() {
+    local fn_left="$1" fn_right="$2"
+    local left_buf right_buf
+    left_buf=$("$fn_left" 2>&1)
+    right_buf=$("$fn_right" 2>&1)
+
+    local term_w=160
+    if command -v tput >/dev/null 2>&1; then
+        term_w=$(tput cols 2>/dev/null || echo 160)
+    fi
+    local col_w=$(( term_w / 2 - 1 ))
+
+    # Read both buffers into arrays
+    local -a L R
+    mapfile -t L <<<"$left_buf"
+    mapfile -t R <<<"$right_buf"
+
+    local rows=${#L[@]}
+    (( ${#R[@]} > rows )) && rows=${#R[@]}
+
+    local i
+    for ((i=0; i<rows; i++)); do
+        local l="${L[$i]:-}"
+        local r="${R[$i]:-}"
+        # Strip color codes for length calculation, then pad with spaces
+        local l_plain="${l//$'\033'\[*([0-9;])m/}"
+        local pad=$(( col_w - ${#l_plain} ))
+        (( pad < 0 )) && pad=0
+        printf '%s%*s   %s\n' "$l" "$pad" "" "$r"
+    done
+}
+
+# ------------------------------------------------------------- cleanup
+cleanup() {
+    if (( ${#BG_PIDS[@]} > 0 )); then
+        kill -TERM "${BG_PIDS[@]}" 2>/dev/null
+        sleep 0.2     # let pipelines drain so 'append' doesn't race the rmdir
+        kill -KILL "${BG_PIDS[@]}" 2>/dev/null
+        wait 2>/dev/null
+    fi
+    if [[ -z "${SENTINEL_KEEP_STATE:-}" ]]; then
+        rm -rf "$STATE_DIR"
+    else
+        printf '%bstate kept at %s%b\n' "$C_DIM" "$STATE_DIR" "$C_RST" >&2
+    fi
+    tput cnorm 2>/dev/null
+    printf '%b' "$C_RST"
+}
+trap cleanup EXIT INT TERM
+
+# ------------------------------------------------------------- state helpers
+init_state() {
+    for f in poh_ticks poh_service poh_slot_timing slot_complete slot_duration \
+             banking_tx banking_rx_us banking_ttp_us tpu_io tpu_receivers \
+             sigverify accounts_store snapshots shred_repair turbine \
+             vote_lat current_leader risk_log lock_cont quic_conns \
+             cluster_slot local_slot rpc_drift cpu_top loadavg nvme_io \
+             ram_info net_drops alerts metrics_seen sys_heartbeat \
+             blocks_produced bank_create_us commit_ms cache_stats cost_tracker \
+             accounts_db_active snapshot_events; do
+        : > "$STATE_DIR/$f"
+    done
+}
+
+# append <file> <line> [maxlines]
+append() {
+    local f="$1" line="$2" max="${3:-300}"
+    { echo "$line" >> "$f" ; } 2>/dev/null
+    local lc; lc=$(wc -l < "$f" 2>/dev/null || echo 0)
+    if (( lc > max + 100 )); then
+        tail -n "$max" "$f" > "$f.t" 2>/dev/null && mv "$f.t" "$f" 2>/dev/null
+    fi
+}
+
+# ============================================================================
+#                          BACKGROUND COLLECTORS
+# ============================================================================
+
+# ---- 1. journalctl parser -------------------------------------------------
+# Universal dispatcher: every "datapoint: NAME ..." line is logged to
+# metrics_seen, then dispatched to a specific handler if one exists.
+# Plus targeted regex matches for non-datapoint patterns (PoH reset, leader).
+log_parser() {
+    set +u
+    exec 2>>"$STATE_DIR/debug.log"
+    while :; do
+        journalctl -u "$SERVICE" -f --no-pager -o cat --since "1 second ago" 2>/dev/null \
+        | while IFS= read -r line; do
+            local ts; ts=$(date +%s.%3N)
+
+            # ---- universal datapoint extractor ----
+            if [[ "$line" =~ datapoint:[[:space:]]+([a-z][a-zA-Z0-9_-]+) ]]; then
+                local dp="${BASH_REMATCH[1]}"
+                echo "$dp" >> "$STATE_DIR/metrics_seen"
+
+                case "$dp" in
+
+                # === Skip-rate proper: your own dropped block production ====
+                blocks_produced)
+                    local prod drop
+                    prod=$(grep -oE 'num_blocks_on_fork=[0-9]+'         <<<"$line" | cut -d= -f2)
+                    drop=$(grep -oE 'num_dropped_blocks_on_fork=[0-9]+' <<<"$line" | cut -d= -f2)
+                    [[ -n "$prod$drop" ]] && append "$STATE_DIR/blocks_produced" \
+                        "$ts ${prod:-0} ${drop:-0}"
+                    ;;
+
+                # === Slot completion / turbine repair signal ================
+                slot_stats_tracking_complete)
+                    local slot rep recv drp
+                    slot=$(grep -oE 'slot=[0-9]+' <<<"$line" | head -1 | cut -d= -f2)
+                    rep=$(grep -oE 'num_repaired=[0-9]+'           <<<"$line" | cut -d= -f2)
+                    recv=$(grep -oE 'num_recovered=[0-9]+'         <<<"$line" | cut -d= -f2)
+                    drp=$(grep -oE 'dropped_packets_count=[0-9]+'  <<<"$line" | cut -d= -f2)
+                    append "$STATE_DIR/slot_complete" \
+                        "$ts ${slot:-0} ${rep:-0} ${recv:-0} ${drp:-0}"
+                    ;;
+
+                # === Slot replay duration (your existing-working source) =====
+                replay-slot-stats|replay-loop-timing-stats|replay_stage_timing)
+                    local slot elapsed
+                    slot=$(grep -oE 'slot=[0-9]+' <<<"$line" | head -1 | cut -d= -f2)
+                    elapsed=$(grep -oE 'replay_total_elapsed=[0-9]+' <<<"$line" | cut -d= -f2)
+                    [[ -z "$elapsed" ]] && elapsed=$(grep -oE 'total_elapsed_us=[0-9]+' <<<"$line" | cut -d= -f2)
+                    [[ -n "$elapsed" ]] && append "$STATE_DIR/slot_duration" \
+                        "$ts ${slot:-0} $elapsed"
+                    ;;
+
+                # === Bank construction latency (early stress signal) ========
+                bank-new_from_parent-heights)
+                    local te
+                    te=$(grep -oE 'total_elapsed_us=[0-9]+' <<<"$line" | cut -d= -f2)
+                    [[ -n "$te" ]] && append "$STATE_DIR/bank_create_us" "$ts $te"
+                    ;;
+
+                # === Commitment latency =====================================
+                block-commitment-cache)
+                    local cm
+                    cm=$(grep -oE 'aggregate-commitment-ms=[0-9]+' <<<"$line" | cut -d= -f2)
+                    [[ -n "$cm" ]] && append "$STATE_DIR/commit_ms" "$ts $cm"
+                    ;;
+
+                # === Loaded programs cache (read pressure on AccountsDB) ====
+                loaded-programs-cache-stats)
+                    local h m
+                    h=$(grep -oE 'hits=[0-9]+'   <<<"$line" | cut -d= -f2)
+                    m=$(grep -oE 'misses=[0-9]+' <<<"$line" | cut -d= -f2)
+                    [[ -n "$h$m" ]] && append "$STATE_DIR/cache_stats" \
+                        "$ts ${h:-0} ${m:-0}"
+                    ;;
+
+                # === PoH (datapoint form, when emitted) =====================
+                # Kept for builds that don't emit poh-service; the real
+                # parser for your build is the poh-service case below.
+                poh_recorder_record_lock_contention|poh-internal-record-time|poh-recorder-tick)
+                    local tc rec
+                    tc=$(grep -oE 'tick_count=[0-9]+' <<<"$line" | cut -d= -f2)
+                    rec=$(grep -oE 'record_lock_contention[a-z_]*=[0-9]+' <<<"$line" | head -1 | cut -d= -f2)
+                    [[ -n "$tc"  ]] && append "$STATE_DIR/poh_ticks" "$ts $tc"
+                    [[ -n "$rec" ]] && append "$STATE_DIR/lock_cont" "$ts poh $rec"
+                    ;;
+
+                # === Banking stage (REAL field names from your build) =======
+                # Datapoint name in your build is "banking_stage-loop-stats"
+                # (the ,id=N part comes after and is stripped by my regex).
+                # Fields confirmed from --list-metrics:
+                #   receive_and_buffer_packets_count, dropped_packets_count,
+                #   newly_buffered_packets_count, current_buffered_packets_count,
+                #   consumed_buffered_packets_count, forwarded_transaction_count,
+                #   receive_and_buffer_packets_elapsed, transaction_processing_elapsed
+                banking_stage-loop-stats)
+                    local rxp drp newb curb cons fwd rx_us ttp_us
+                    rxp=$(grep -oE 'receive_and_buffer_packets_count=[0-9]+' <<<"$line" | cut -d= -f2)
+                    drp=$(grep -oE 'dropped_packets_count=[0-9]+' <<<"$line" | head -1 | cut -d= -f2)
+                    newb=$(grep -oE 'newly_buffered_packets_count=[0-9]+' <<<"$line" | cut -d= -f2)
+                    curb=$(grep -oE 'current_buffered_packets_count=[0-9]+' <<<"$line" | cut -d= -f2)
+                    cons=$(grep -oE 'consumed_buffered_packets_count=[0-9]+' <<<"$line" | cut -d= -f2)
+                    fwd=$(grep -oE 'forwarded_transaction_count=[0-9]+' <<<"$line" | cut -d= -f2)
+                    rx_us=$(grep -oE 'receive_and_buffer_packets_elapsed=[0-9]+' <<<"$line" | cut -d= -f2)
+                    ttp_us=$(grep -oE 'transaction_processing_elapsed=[0-9]+' <<<"$line" | cut -d= -f2)
+                    if [[ -n "$rxp$drp$cons" ]]; then
+                        # banking_tx: ts received dropped consumed buffered forwarded
+                        append "$STATE_DIR/banking_tx" \
+                          "$ts ${rxp:-0} ${drp:-0} ${cons:-0} ${curb:-0} ${fwd:-0}"
+                    fi
+                    [[ -n "$rx_us"  ]] && append "$STATE_DIR/banking_rx_us"  "$ts $rx_us"
+                    [[ -n "$ttp_us" ]] && append "$STATE_DIR/banking_ttp_us" "$ts $ttp_us"
+                    ;;
+
+                # === TPU receiver (multi-receiver: tpu, vote, forwards) =====
+                # Each emits its own datapoint; we just count the aggregate
+                # presence by recording 1 event per emission. Real packet
+                # accounting lives in banking_stage-loop-stats above.
+                tpu_receiver|tpu_vote_receiver|tpu_forwards_receiver)
+                    append "$STATE_DIR/tpu_receivers" "$ts $dp"
+                    ;;
+
+                # === QUIC TPU connections + throttling =====================
+                quic_streamer_tpu|quic_streamer_tpu_forwards|quic_streamer_tpu_vote)
+                    local act tot thr fail
+                    act=$(grep -oE 'active_connections=[0-9]+' <<<"$line" | cut -d= -f2)
+                    tot=$(grep -oE 'total_incoming_connection_attempts=[0-9]+' <<<"$line" | cut -d= -f2)
+                    thr=$(grep -oE 'throttled_streams=[0-9]+' <<<"$line" | cut -d= -f2)
+                    fail=$(grep -oE 'connection_setup_timeout=[0-9]+' <<<"$line" | cut -d= -f2)
+                    # only record main TPU stream for the panel
+                    if [[ "$dp" == "quic_streamer_tpu" ]]; then
+                        append "$STATE_DIR/quic_conns" \
+                          "$ts ${act:-0} ${tot:-0} ${thr:-0} ${fail:-0}"
+                    fi
+                    ;;
+
+                # === Shred SigVerify (the actual one your build emits) ======
+                shred_sigverify)
+                    # fields vary; capture any *_us total for trend
+                    local sv_us
+                    sv_us=$(grep -oE 'elapsed=[0-9]+' <<<"$line" | head -1 | cut -d= -f2)
+                    [[ -z "$sv_us" ]] && sv_us=$(grep -oE 'total_us=[0-9]+' <<<"$line" | cut -d= -f2)
+                    [[ -n "$sv_us" ]] && append "$STATE_DIR/sigverify" "$ts $sv_us"
+                    ;;
+
+                # === PoH service (rich datapoint, replaces fallback) ========
+                # poh-service ticks=N hashes=N elapsed_us=N total_sleep_us=N
+                #   total_lock_time_us=N total_record_time_us=N
+                poh-service)
+                    local ticks hashes lock_us rec_us elapsed_us
+                    ticks=$(grep -oE 'ticks=[0-9]+' <<<"$line" | cut -d= -f2)
+                    hashes=$(grep -oE 'hashes=[0-9]+' <<<"$line" | cut -d= -f2)
+                    lock_us=$(grep -oE 'total_lock_time_us=[0-9]+' <<<"$line" | cut -d= -f2)
+                    rec_us=$(grep -oE 'total_record_time_us=[0-9]+' <<<"$line" | cut -d= -f2)
+                    elapsed_us=$(grep -oE 'elapsed_us=[0-9]+' <<<"$line" | cut -d= -f2)
+                    if [[ -n "$ticks$hashes$lock_us$rec_us$elapsed_us" ]]; then
+                        append "$STATE_DIR/poh_service" \
+                          "$ts ${ticks:-0} ${hashes:-0} ${lock_us:-0} ${rec_us:-0} ${elapsed_us:-0}"
+                    fi
+                    ;;
+
+                # === poh_slot_timing — direct slot-fill timing! =============
+                # poh_slot_timing slot=... start_to_full_time_diff=... ...
+                # This tells us how long it actually took to fill a slot.
+                poh_slot_timing)
+                    local sft eft
+                    sft=$(grep -oE 'start_to_full_time_diff=-?[0-9]+' <<<"$line" | cut -d= -f2)
+                    eft=$(grep -oE 'full_to_end_time_diff=-?[0-9]+' <<<"$line" | cut -d= -f2)
+                    [[ -n "$sft$eft" ]] && append "$STATE_DIR/poh_slot_timing" \
+                        "$ts ${sft:-0} ${eft:-0}"
+                    ;;
+
+                # === Cost tracker (CU consumption per slot) =================
+                cost_tracker_stats)
+                    local bcost vcost txc nacct
+                    bcost=$(grep -oE 'block_cost=[0-9]+' <<<"$line" | cut -d= -f2)
+                    vcost=$(grep -oE 'vote_cost=[0-9]+' <<<"$line" | cut -d= -f2)
+                    txc=$(grep -oE 'transaction_count=[0-9]+' <<<"$line" | head -1 | cut -d= -f2)
+                    nacct=$(grep -oE 'number_of_accounts=[0-9]+' <<<"$line" | cut -d= -f2)
+                    # Only require block_cost — that's the primary signal.
+                    # Other fields default to 0 if the build doesn't emit them.
+                    if [[ -n "$bcost" ]]; then
+                        append "$STATE_DIR/cost_tracker" \
+                            "$ts $bcost ${vcost:-0} ${txc:-0} ${nacct:-0}"
+                    fi
+                    ;;
+
+                # === AccountsDB =============================================
+                # Your build emits both accounts_db_store_timings AND
+                # accounts_db_store_timings2 (the latter ~similar count).
+                accounts_db_store_timings|accounts_db_store_timings2)
+                    local st flush
+                    st=$(grep -oE 'store_us=[0-9]+' <<<"$line" | cut -d= -f2)
+                    [[ -z "$st" ]] && st=$(grep -oE 'total_us=[0-9]+' <<<"$line" | cut -d= -f2)
+                    flush=$(grep -oE 'flush_us=[0-9]+' <<<"$line" | cut -d= -f2)
+                    [[ -n "$st$flush" ]] && append "$STATE_DIR/accounts_store" \
+                        "$ts ${st:-0} ${flush:-0}"
+                    ;;
+                # === Snapshot-related events (used for in-progress detection)
+                accounts_db_active)
+                    # Frequently-emitted heartbeat. Burst rate goes up sharply
+                    # while a snapshot is being created.
+                    append "$STATE_DIR/accounts_db_active" "$ts 1"
+                    ;;
+                snapshot-package|snapshot_creation|bank_snapshot|snapshot_packager_service|snapshot_bank|archive-snapshot-package|handle_snapshot_requests|handle_snapshot_requests-timing|get_snapshot_storages|serialize_account_storage_ms|accounts_hash_verifier)
+                    local sn
+                    sn=$(grep -oE 'total_us=[0-9]+' <<<"$line" | cut -d= -f2)
+                    [[ -z "$sn" ]] && sn=$(grep -oE 'duration_us=[0-9]+' <<<"$line" | cut -d= -f2)
+                    [[ -z "$sn" ]] && sn=$(grep -oE 'elapsed_ms=[0-9]+' <<<"$line" | cut -d= -f2)
+                    [[ -n "$sn" ]] && append "$STATE_DIR/snapshots" "$ts $sn"
+                    # Mark a snapshot phase event regardless of timing field
+                    append "$STATE_DIR/snapshot_events" "$ts $dp"
+                    ;;
+
+                # === Shreds / Turbine =======================================
+                shred_fetch|shred_fetch_repair)
+                    local sc; sc=$(grep -oE 'shred_count=[0-9]+' <<<"$line" | cut -d= -f2)
+                    [[ -n "$sc" ]] && append "$STATE_DIR/shred_repair" "$ts $sc"
+                    ;;
+                retransmit-stage-slot-stats)
+                    local l1 l2 elap
+                    l1=$(grep -oE 'num_shreds_received_1st_layer=[0-9]+' <<<"$line" | cut -d= -f2)
+                    l2=$(grep -oE 'num_shreds_received_2nd_layer=[0-9]+' <<<"$line" | cut -d= -f2)
+                    elap=$(grep -oE 'elapsed_millis=[0-9]+' <<<"$line" | cut -d= -f2)
+                    [[ -n "$l1$l2" ]] && append "$STATE_DIR/turbine" \
+                        "$ts ${l1:-0} ${l2:-0} ${elap:-0}"
+                    ;;
+
+                # === Vote latency ===========================================
+                vote-processing-timing)
+                    local vu; vu=$(grep -oE 'vote_txn_processing_us=[0-9]+' <<<"$line" | cut -d= -f2)
+                    [[ -n "$vu" ]] && append "$STATE_DIR/vote_lat" "$ts $vu"
+                    ;;
+
+                # === QUIC fallback for non-X1 builds ========================
+                quic-server|quic_server)
+                    local nc
+                    nc=$(grep -oE 'num_connections=[0-9]+' <<<"$line" | cut -d= -f2)
+                    [[ -z "$nc" ]] && nc=$(grep -oE 'connection_count=[0-9]+' <<<"$line" | cut -d= -f2)
+                    [[ -n "$nc" ]] && append "$STATE_DIR/quic_conns" "$ts ${nc:-0} 0 0 0"
+                    ;;
+                esac
+            fi
+
+            # ---- non-datapoint patterns ----
+
+            # Leader from "reset poh from: PUBKEY,..."
+            if [[ "$line" == *"reset poh from:"* ]]; then
+                local pk
+                pk=$(grep -oE 'reset poh from: [1-9A-HJ-NP-Za-km-z]{32,44}' <<<"$line" \
+                     | awk '{print $NF}')
+                if [[ -n "$pk" && "$pk" != "$MY_PUBKEY" ]]; then
+                    echo "$ts $pk" > "$STATE_DIR/current_leader"
+                fi
+            fi
+
+            # PoH tick (cumulative) from "reset PoH to tick N (within slot ...)"
+            if [[ "$line" == *"reset PoH to tick "* ]]; then
+                local tk
+                tk=$(grep -oE 'reset PoH to tick [0-9]+' <<<"$line" | awk '{print $NF}')
+                [[ -n "$tk" ]] && append "$STATE_DIR/poh_ticks" "$ts $tk"
+            fi
+        done
+        sleep 1   # journalctl quit; restart loop
+    done
+}
+
+# ---- 2. RPC drift watcher --------------------------------------------------
+rpc_watcher() {
+    set +u
+    exec 2>>"$STATE_DIR/debug.log"
+    while :; do
+        local local_s cluster_s
+        local_s=$(timeout 2 curl -s -X POST -H 'Content-Type: application/json' \
+            -d '{"jsonrpc":"2.0","id":1,"method":"getSlot","params":[{"commitment":"processed"}]}' \
+            "$RPC_URL" 2>/dev/null | grep -oE '"result":[0-9]+' | cut -d: -f2)
+        cluster_s=$(timeout 3 curl -s -X POST -H 'Content-Type: application/json' \
+            -d '{"jsonrpc":"2.0","id":1,"method":"getSlot","params":[{"commitment":"processed"}]}' \
+            "$CLUSTER_RPC" 2>/dev/null | grep -oE '"result":[0-9]+' | cut -d: -f2)
+        local ts; ts=$(date +%s)
+        [[ -n "$local_s"   ]] && echo "$ts $local_s"   > "$STATE_DIR/local_slot"
+        [[ -n "$cluster_s" ]] && echo "$ts $cluster_s" > "$STATE_DIR/cluster_slot"
+        if [[ -n "$local_s" && -n "$cluster_s" ]]; then
+            echo "$ts $((cluster_s - local_s))" >> "$STATE_DIR/rpc_drift"
+        fi
+        sleep 2
+    done
+}
+
+# ---- 3. System collector (kept small and defensive) ------------------------
+sys_collector() {
+    exec 2>>"$STATE_DIR/debug.log"
+    echo "[$(date)] sys_collector starting (pid=$BASHPID)" >&2
+
+    declare -A pi pt
+    while :; do
+        # ---- Heartbeat (proves loop is alive) ----
+        date +%s > "$STATE_DIR/sys_heartbeat"
+
+        # ---- Always-write metrics first (won't fail) ----
+        local load1="?" load5="?"
+        if [[ -r /proc/loadavg ]]; then
+            read -r load1 load5 _ < /proc/loadavg
+        fi
+        echo "load1=$load1 load5=$load5 ncpu=$NCPU" > "$STATE_DIR/loadavg"
+
+        local mt ma mp=0
+        mt=$(awk '/^MemTotal:/{print $2; exit}'   /proc/meminfo 2>/dev/null)
+        ma=$(awk '/^MemAvailable:/{print $2; exit}' /proc/meminfo 2>/dev/null)
+        if [[ -n "$mt" && "$mt" -gt 0 ]]; then
+            mp=$(( 100 - (100*${ma:-0}/mt) ))
+        fi
+        local pgmajfault
+        pgmajfault=$(awk '/^pgmajfault/{print $2; exit}' /proc/vmstat 2>/dev/null)
+        echo "mem=${mp}% pgmajfault=${pgmajfault:-0}" > "$STATE_DIR/ram_info"
+
+        local nd
+        nd=$(awk 'NR>2{d+=$5}END{print d+0}' /proc/net/dev 2>/dev/null)
+        echo "rx_drops=${nd:-0}" > "$STATE_DIR/net_drops"
+
+        # ---- Per-core CPU (best effort; failure here mustn't break loop) ----
+        {
+            local cores_file="$STATE_DIR/.cores"
+            : > "$cores_file"
+            local id u n s idle iow ir si total prev_idle prev_total di dt pct
+            while read -r id u n s idle iow ir si _; do
+                [[ "$id" =~ ^cpu[0-9]+$ ]] || continue
+                : "${u:=0}" "${n:=0}" "${s:=0}" "${idle:=0}" "${iow:=0}" "${ir:=0}" "${si:=0}"
+                total=$(( u + n + s + idle + iow + ir + si ))
+                prev_idle=${pi[$id]:-0}
+                prev_total=${pt[$id]:-0}
+                di=$(( idle - prev_idle ))
+                dt=$(( total - prev_total ))
+                pct=0
+                (( dt > 0 )) && pct=$(( (100*(dt-di))/dt ))
+                (( pct < 0 )) && pct=0
+                (( pct > 100 )) && pct=100
+                echo "$pct ${id#cpu}" >> "$cores_file"
+                pi[$id]=$idle
+                pt[$id]=$total
+            done < /proc/stat
+            if [[ -s "$cores_file" ]]; then
+                sort -rn "$cores_file" | head -4 \
+                    | awk '{printf "c%s=%s%% ", $2, $1}' \
+                    > "$STATE_DIR/cpu_top"
+            fi
+        } || echo "[$(date)] cpu loop returned $?" >&2
+
+        sleep 2
+    done
+}
+
+# ---- 4. NVMe collector -----------------------------------------------------
+nvme_collector() {
+    set +u
+    exec 2>>"$STATE_DIR/debug.log"
+    if ! command -v iostat >/dev/null 2>&1; then
+        echo "iostat-missing" > "$STATE_DIR/nvme_io"
+        return
+    fi
+    while :; do
+        # iostat -dxy 2 1 prints one summary; columns vary by version, so
+        # extract by NAME from the header instead of by index.
+        local out
+        out=$(iostat -dxy 2 1 "$NVME_DEV" 2>/dev/null)
+        if [[ -n "$out" ]]; then
+            echo "$out" | awk -v dev="$NVME_DEV" '
+                /^Device/ {
+                    for (i=1; i<=NF; i++) col[$i]=i
+                    next
+                }
+                $1==dev {
+                    rkb = (col["rkB/s"]   ? $col["rkB/s"]   : "?")
+                    wkb = (col["wkB/s"]   ? $col["wkB/s"]   : "?")
+                    rw  = (col["r_await"] ? $col["r_await"] : "?")
+                    ww  = (col["w_await"] ? $col["w_await"] : "?")
+                    qd  = (col["aqu-sz"]  ? $col["aqu-sz"]  : (col["avgqu-sz"] ? $col["avgqu-sz"] : "?"))
+                    util= (col["%util"]   ? $col["%util"]   : "?")
+                    printf "rkB/s=%s wkB/s=%s r_await=%s w_await=%s qd=%s util=%s%%\n", rkb, wkb, rw, ww, qd, util
+                }' > "$STATE_DIR/nvme_io"
+        fi
+    done
+}
+
+# ============================================================================
+#                          MATH / RATE HELPERS
+# ============================================================================
+
+# rate_from_counter <file> <window_sec> <col_idx>   (col_idx is 1-based of value)
+# Returns: rate per second from cumulative counter, computed over last window_sec
+rate_from_counter() {
+    local f="$1" win="$2" col="$3"
+    [[ ! -s "$f" ]] && { echo "0"; return; }
+    local now; now=$(date +%s.%3N)
+    awk -v now="$now" -v win="$win" -v c="$col" '
+        {
+            ts=$1; v=$(c+1)
+            if (now-ts <= win) {
+                if (firstv=="") { firstv=v; firstts=ts }
+                lastv=v; lastts=ts
+            }
+        }
+        END {
+            if (lastts==firstts || firstv=="") { print "0"; exit }
+            d = lastv - firstv
+            if (d<0) d=lastv  # counter reset
+            dt = lastts - firstts
+            if (dt<=0) { print "0"; exit }
+            printf "%.1f\n", d/dt
+        }' "$f"
+}
+
+# avg_recent <file> <window_sec> <col_idx>
+avg_recent() {
+    local f="$1" win="$2" col="$3"
+    [[ ! -s "$f" ]] && { echo "0"; return; }
+    local now; now=$(date +%s.%3N)
+    awk -v now="$now" -v win="$win" -v c="$col" '
+        { if (now-$1 <= win) { sum+=$(c+1); n++ } }
+        END { if (n>0) printf "%.0f\n", sum/n; else print "0" }' "$f"
+}
+
+# max_recent <file> <window_sec> <col_idx>
+max_recent() {
+    local f="$1" win="$2" col="$3"
+    [[ ! -s "$f" ]] && { echo "0"; return; }
+    local now; now=$(date +%s.%3N)
+    awk -v now="$now" -v win="$win" -v c="$col" '
+        { if (now-$1 <= win && $(c+1)+0 > m) m=$(c+1)+0 }
+        END { print m+0 }' "$f"
+}
+
+# pct_above <file> <window_sec> <col_idx> <threshold>
+pct_above() {
+    local f="$1" win="$2" col="$3" thr="$4"
+    [[ ! -s "$f" ]] && { echo "0"; return; }
+    local now; now=$(date +%s.%3N)
+    awk -v now="$now" -v win="$win" -v c="$col" -v t="$thr" '
+        { if (now-$1 <= win) { n++; if ($(c+1)+0 > t) k++ } }
+        END { if (n>0) printf "%.0f\n", 100*k/n; else print "0" }' "$f"
+}
+
+# stddev_intertick <file> <window_sec> <col_idx>  (jitter for cumulative ticks)
+jitter_ms() {
+    local f="$1" win="$2" col="$3"
+    [[ ! -s "$f" ]] && { echo "0"; return; }
+    local now; now=$(date +%s.%3N)
+    awk -v now="$now" -v win="$win" -v c="$col" '
+        BEGIN { prev_ts=-1; prev_v=-1 }
+        {
+            if (now-$1 > win) next
+            if (prev_v >=0 && $(c+1) > prev_v) {
+                gap = ($1 - prev_ts) * 1000.0 / ($(c+1) - prev_v)
+                gaps[++n] = gap
+                sum += gap
+            }
+            prev_ts = $1; prev_v = $(c+1)
+        }
+        END {
+            if (n<2) { print "0"; exit }
+            mean = sum/n
+            for (i=1; i<=n; i++) ss += (gaps[i]-mean)^2
+            printf "%.1f\n", sqrt(ss/n)
+        }' "$f"
+}
+
+# ============================================================================
+#                          PANEL RENDERERS
+# ============================================================================
+
+bar() {  # bar <pct> <width> <good|warn|bad>
+    local pct=$1 w=${2:-20} mode=${3:-auto}
+    (( pct > 100 )) && pct=100; (( pct < 0 )) && pct=0
+    local fill=$(( pct*w/100 ))
+    local color
+    case "$mode" in
+        good) color=$C_GRN ;;
+        warn) color=$C_YEL ;;
+        bad)  color=$C_RED ;;
+        *)    if (( pct >= 85 )); then color=$C_RED
+              elif (( pct >= 65 )); then color=$C_YEL
+              else color=$C_GRN; fi ;;
+    esac
+    local s=""; local i
+    for ((i=0; i<fill; i++)); do s+="█"; done
+    for ((i=fill; i<w; i++)); do s+="░"; done
+    printf '%b%s%b' "$color" "$s" "$C_RST"
+}
+
+risk_color() {  # echoes color based on level: LOW MED HIGH CRIT
+    case "$1" in
+        CRIT) echo "$C_RED$C_BLD" ;;
+        HIGH) echo "$C_RED" ;;
+        MED)  echo "$C_YEL" ;;
+        *)    echo "$C_GRN" ;;
+    esac
+}
+
+# =============================================================================
+#                              PANEL RENDERERS
+# Each panel:
+#   1) Computes its values
+#   2) Determines per-metric status (ok/warn/crit/idle)
+#   3) Picks an overall panel status (worst non-idle metric)
+#   4) Builds a sparkline of the headline metric
+#   5) Prints header / rows / optional help / footer
+# =============================================================================
+
+# ---- HEADER (top-of-screen identity strip) --------------------------------
+# ==========================================================================
+#                 SUPPORT FUNCTIONS (compute_risk, snapshot detector)
+# ==========================================================================
+detect_snapshot_state() {
+    # signal 1: disk write rate
+    local wkb=0
+    if [[ -s "$STATE_DIR/nvme_io" ]]; then
+        wkb=$(grep -oE 'wkB/s=[0-9.]+' "$STATE_DIR/nvme_io" | cut -d= -f2 | head -1)
+        wkb=${wkb:-0}
+    fi
+    local disk_busy=0
+    awk -v w="$wkb" 'BEGIN{exit !(w > 200000)}' && disk_busy=1
+
+    # signal 2: accounts_db_active burst rate (samples per sec over last 10s)
+    local adb_rate=0
+    if [[ -s "$STATE_DIR/accounts_db_active" ]]; then
+        adb_rate=$(awk -v now="$(date +%s.%3N)" -v win=10 '
+            { if (now-$1 <= win) n++ }
+            END { printf "%.1f", (n+0)/win }
+        ' "$STATE_DIR/accounts_db_active")
+    fi
+    local adb_busy=0
+    awk -v r="$adb_rate" 'BEGIN{exit !(r > 5)}' && adb_busy=1
+
+    # signal 3: snapshot_events emission within last 30s
+    local recent_events=0
+    if [[ -s "$STATE_DIR/snapshot_events" ]]; then
+        recent_events=$(awk -v now="$(date +%s.%3N)" -v win=30 \
+            '{ if (now-$1 <= win) n++ } END { print n+0 }' \
+            "$STATE_DIR/snapshot_events")
+    fi
+    local snap_busy=0
+    (( recent_events > 0 )) && snap_busy=1
+
+    local score=$((disk_busy + adb_busy + snap_busy))
+    local state phase_color
+    case $score in
+        0) state="idle";        phase_color="$C_GRN" ;;
+        1) state="building";    phase_color="$C_YEL" ;;
+        2) state="in-progress"; phase_color="$C_YEL" ;;
+        3) state="active";      phase_color="$C_RED" ;;
+    esac
+
+    # Echo: state|color|disk_busy|adb_busy|snap_busy|wkb|adb_rate|recent_events
+    echo "${state}|${phase_color}|${disk_busy}|${adb_busy}|${snap_busy}|${wkb}|${adb_rate}|${recent_events}"
+}
+
+compute_risk() {
+    local poh_rate poh_jit drop_pct near_pct store_us drift block_drop_pct cu_pct thr_rate
+
+    # PoH rate prefers poh-service, falls back to reset-poh ticks
+    if (( $(wc -l < "$STATE_DIR/poh_service" 2>/dev/null || echo 0) >= 2 )); then
+        poh_rate=$(awk -v now="$(date +%s.%3N)" -v win=30 '
+            { if (now-$1 <= win) { sum+=$2; if (firstts=="") firstts=$1; lastts=$1 } }
+            END { dt=lastts-firstts; if (dt>0) printf "%.1f", sum/dt; else print "0" }
+        ' "$STATE_DIR/poh_service")
+        # CV % of ticks-per-emission (steady ~160 → ~0%; jittery → 10%+)
+        poh_jit=$(awk -v now="$(date +%s.%3N)" -v win=30 '
+            { if (now-$1 <= win) { vals[++n]=$2; sum+=$2 } }
+            END { if (n<2) {print "0"; exit}
+                  m=sum/n
+                  for (i=1;i<=n;i++) ss+=(vals[i]-m)^2
+                  sd=sqrt(ss/n)
+                  if (m>0) printf "%.1f", 100*sd/m
+                  else print "0" }
+        ' "$STATE_DIR/poh_service")
+    else
+        poh_rate=$(rate_from_counter "$STATE_DIR/poh_ticks" 30 1)
+        poh_jit=$(jitter_ms          "$STATE_DIR/poh_ticks" 30 1)
+    fi
+
+    # Banking drop % - only meaningful when actively consuming (= leading)
+    drop_pct=0
+    local rxr dxr consr
+    rxr=$(rate_from_counter "$STATE_DIR/banking_tx" 30 1)
+    dxr=$(rate_from_counter "$STATE_DIR/banking_tx" 30 2)
+    consr=$(rate_from_counter "$STATE_DIR/banking_tx" 30 3)
+    # Only treat banking drops as a real signal if we're consuming. Otherwise
+    # drops are normal load-shedding when not leading.
+    if awk -v c="$consr" 'BEGIN{exit !(c > 0)}'; then
+        if awk -v r="$rxr" -v d="$dxr" 'BEGIN{exit !(r+d > 0)}'; then
+            drop_pct=$(awk -v r="$rxr" -v d="$dxr" 'BEGIN{printf "%.1f", 100*d/(r+d)}')
+        fi
+    fi
+
+    # Near-budget: prefer poh_slot_timing (your slot fill), fall back to replay
+    if (( $(wc -l < "$STATE_DIR/poh_slot_timing" 2>/dev/null || echo 0) >= 2 )); then
+        near_pct=$(pct_above "$STATE_DIR/poh_slot_timing" 60 1 $((BUDGET_MS*80/100)))
+    else
+        near_pct=$(pct_above "$STATE_DIR/slot_duration" 60 2 $((BUDGET_MS*1000*80/100)))
+    fi
+
+    store_us=$(avg_recent "$STATE_DIR/accounts_store" 60 1)
+    drift=$(tail -1 "$STATE_DIR/rpc_drift" 2>/dev/null | awk '{print $2}')
+    drift=${drift:-0}
+
+    # CU saturation (block_cost vs 48M)
+    cu_pct=0
+    if [[ -s "$STATE_DIR/cost_tracker" ]]; then
+        local last_bcost
+        last_bcost=$(tail -1 "$STATE_DIR/cost_tracker" | awk '{print $2}')
+        [[ "${last_bcost:-0}" -gt 0 ]] && cu_pct=$(( last_bcost*100/48000000 ))
+    fi
+
+    # CPU saturation from loadavg (most predictive on this validator!)
+    local cpu_sat_pct=0
+    if [[ -s "$STATE_DIR/loadavg" ]]; then
+        local l1 nc
+        l1=$(awk -F'[= ]' '{for(i=1;i<=NF;i++)if($i=="load1"){print $(i+1);exit}}' "$STATE_DIR/loadavg")
+        nc=$(awk -F'[= ]' '{for(i=1;i<=NF;i++)if($i=="ncpu"){print $(i+1);exit}}' "$STATE_DIR/loadavg")
+        if awk -v n="$nc" 'BEGIN{exit !(n > 0)}'; then
+            cpu_sat_pct=$(awk -v l="$l1" -v n="$nc" 'BEGIN{printf "%.0f", 100*l/n}')
+        fi
+    fi
+
+    # QUIC throttle rate
+    thr_rate=$(rate_from_counter "$STATE_DIR/quic_conns" 60 3)
+
+    # Recent block drop rate (your own production)
+    block_drop_pct=0
+    if (( $(wc -l < "$STATE_DIR/blocks_produced" 2>/dev/null || echo 0) >= 2 )); then
+        local fp lp fd ld
+        read -r _ fp fd < <(head -1 "$STATE_DIR/blocks_produced")
+        read -r _ lp ld < <(tail -1 "$STATE_DIR/blocks_produced")
+        local dp dd
+        dp=$(( lp - fp )); dd=$(( ld - fd ))
+        if (( dp + dd > 0 )); then
+            block_drop_pct=$(awk -v p="$dp" -v d="$dd" \
+                'BEGIN{printf "%.2f", 100*d/(p+d)}')
+        fi
+    fi
+
+    # Detect snapshot state — if active, dampen near-budget & disk-related contributors
+    local snap_state
+    snap_state=$(detect_snapshot_state | cut -d'|' -f1)
+
+    # weighted score, each contributor capped at 30 so no single bad metric pegs CRIT
+    awk -v pr="$poh_rate" -v pj="$poh_jit" -v dp="$drop_pct" \
+        -v np="$near_pct" -v st="$store_us" -v dr="$drift" -v bd="$block_drop_pct" \
+        -v cu="$cu_pct" -v thr="$thr_rate" -v csat="$cpu_sat_pct" \
+        -v snap="$snap_state" '
+        function cap(x, lim) { return (x > lim ? lim : x) }
+        BEGIN {
+            s = 0; reasons = ""
+            # Snapshot active: dampen disk/timing-related contributors
+            snap_dampen = (snap == "active" || snap == "in-progress") ? 0.4 : 1.0
+            # PoH rate too low (CPU starvation)
+            if (pr > 0 && pr < 140) {
+                x = cap((140-pr)*0.6, 25)
+                s += x; reasons = reasons sprintf("PoH-rate(%.0f) ", x)
+            }
+            # PoH coefficient-of-variation > 5% means jittery clock
+            if (pj > 5) {
+                x = cap((pj-5)*1.5, 20)
+                s += x; reasons = reasons sprintf("PoH-CV(%.0f) ", x)
+            }
+            # Banking ingress drop % (only when leading)
+            if (dp > 1) {
+                x = cap((dp-1)*2, 25)
+                s += x; reasons = reasons sprintf("BankDrop(%.1f%%, +%.0f) ", dp, x)
+            }
+            # Slot fill / replay near budget pct - only flag when consistently very close
+            # X1 mainnet often runs slots at 350-450ms naturally so threshold is now 60
+            # Dampened during snapshot windows (transient, not validator fault)
+            if (np > 60) {
+                x = cap((np-60)*0.3*snap_dampen, 15)
+                s += x; reasons = reasons sprintf("near-budget(%.0f%%, +%.0f) ", np, x)
+            }
+            # AccountsDB store latency µs (also dampened during snapshots)
+            if (st > 50000) {
+                x = cap((st-50000)/2000*snap_dampen, 20)
+                s += x; reasons = reasons sprintf("AcctsDB(%.0f) ", x)
+            }
+            # RPC slot drift
+            if (dr > 2) {
+                x = cap((dr-2)*3, 30)
+                s += x; reasons = reasons sprintf("drift(%dslots, +%.0f) ", dr, x)
+            }
+            # Recent block drop % (heaviest, this is the actual skip rate)
+            if (bd > 1.5) {
+                x = cap((bd-1.5)*5, 30)
+                s += x; reasons = reasons sprintf("block-drop(%.2f%%, +%.0f) ", bd, x)
+            }
+            # CU saturation
+            if (cu > 90) {
+                x = cap((cu-90)*1.5, 15)
+                s += x; reasons = reasons sprintf("CU-sat(%d%%) ", cu)
+            }
+            # QUIC throttling rate
+            if (thr > 1) {
+                x = cap((thr-1)*2, 15)
+                s += x; reasons = reasons sprintf("QUIC-throttle(%.0f) ", x)
+            }
+            # CPU saturation from loadavg vs ncpu — early skip predictor
+            if (csat > 60) {
+                x = cap((csat-60)*0.5, 25)
+                s += x; reasons = reasons sprintf("CPU-sat(%d%%, +%.0f) ", csat, x)
+            }
+            level = "LOW"
+            if (s > 25) level = "MED"
+            if (s > 55) level = "HIGH"
+            if (s > 90) level = "CRIT"
+            printf "%d|%s|%s\n", s, level, reasons
+        }'
+}
+
+draw_header() {
+    local now drift_val drift_status drift_color
+    local leader_pk leader_short uptime
+    now=$(date '+%Y-%m-%d %H:%M:%S')
+
+    if [[ -s "$STATE_DIR/rpc_drift" ]]; then
+        drift_val=$(tail -1 "$STATE_DIR/rpc_drift" | awk '{print $2}')
+    else
+        drift_val="?"
+    fi
+    if [[ "$drift_val" == "?" ]]; then
+        drift_status="idle"
+    else
+        drift_status=$(status_for_value "$drift_val" 2 5)
+    fi
+    drift_color=$(color_for_status "$drift_status")
+
+    if [[ -s "$STATE_DIR/current_leader" ]]; then
+        leader_pk=$(awk '{print $2}' "$STATE_DIR/current_leader")
+        leader_short="${leader_pk:0:8}…${leader_pk: -4}"
+    else
+        leader_short="—"
+    fi
+
+    uptime=$(systemctl show "$SERVICE" -p ActiveEnterTimestamp --value 2>/dev/null)
+
+    printf '%b%s%b\n' "$C_BLD$C_CYN" \
+        "═════════════════ X1 SENTINEL ─ $HOST ─ $now ═════════════════" \
+        "$C_RST"
+
+    local id_short
+    if [[ "$MY_PUBKEY" == "unknown" || ${#MY_PUBKEY} -lt 20 ]]; then
+        id_short="${C_YEL}unset${C_RST}"
+    else
+        id_short="${MY_PUBKEY:0:8}…${MY_PUBKEY: -4}"
+    fi
+    printf '  %bIdentity%b %s   %bService%b %s\n' \
+        "$C_DIM" "$C_RST" "$id_short" \
+        "$C_DIM" "$C_RST" "$SERVICE"
+    printf '  %bSlot drift%b %b%s%b   %bLeader%b %s   %bSince%b %s\n' \
+        "$C_DIM" "$C_RST" "$drift_color" "$drift_val" "$C_RST" \
+        "$C_DIM" "$C_RST" "$leader_short" \
+        "$C_DIM" "$C_RST" "${uptime:-?}"
+}
+
+# ---- 1. PoH HEALTH --------------------------------------------------------
+draw_poh() {
+    local rate jit lock_us rec_us samples_svc samples_fb source
+
+    samples_svc=$(wc -l < "$STATE_DIR/poh_service" 2>/dev/null || echo 0)
+    samples_fb=$(wc -l < "$STATE_DIR/poh_ticks" 2>/dev/null || echo 0)
+
+    if (( samples_svc >= 2 )); then
+        rate=$(awk -v now="$(date +%s.%3N)" -v win=30 '
+            { if (now-$1 <= win) { sum+=$2; if (firstts=="") firstts=$1; lastts=$1 } }
+            END { dt=lastts-firstts; if (dt>0) printf "%.1f", sum/dt; else print "0" }
+        ' "$STATE_DIR/poh_service")
+        jit=$(awk -v now="$(date +%s.%3N)" -v win=30 '
+            { if (now-$1 <= win) { vals[++n]=$2; sum+=$2 } }
+            END { if (n<2) {print "0"; exit}
+                  m=sum/n
+                  for (i=1;i<=n;i++) ss+=(vals[i]-m)^2
+                  sd=sqrt(ss/n)
+                  if (m>0) printf "%.1f", 100*sd/m
+                  else print "0" }
+        ' "$STATE_DIR/poh_service")
+        lock_us=$(avg_recent "$STATE_DIR/poh_service" 30 3)
+        rec_us=$(avg_recent  "$STATE_DIR/poh_service" 30 4)
+        source="poh-service"
+    elif (( samples_fb >= 2 )); then
+        rate=$(rate_from_counter "$STATE_DIR/poh_ticks" 30 1)
+        jit=$(jitter_ms          "$STATE_DIR/poh_ticks" 30 1)
+        lock_us=0; rec_us=0
+        source="reset-poh fallback"
+    else
+        rate=0; jit=0; lock_us=0; rec_us=0
+        source="(no data)"
+    fi
+
+    # Status per metric
+    local s_rate s_jit s_lock s_rec
+    if (( samples_svc < 2 && samples_fb < 2 )); then
+        s_rate="idle"; s_jit="idle"; s_lock="idle"; s_rec="idle"
+    else
+        s_rate=$(status_for_value "$rate" 140 100 1)   # reverse: lower is worse
+        s_jit=$(status_for_value  "$jit"  5 10)
+        s_lock=$(status_for_value "$lock_us" 2000 10000)
+        if [[ "$rec_us" == "0" || "$rec_us" == "0.0" ]]; then s_rec="idle"
+        else s_rec=$(status_for_value "$rec_us" 2000 5000); fi
+    fi
+
+    # Overall panel status = worst of the active ones
+    local panel_status="ok"
+    for s in "$s_rate" "$s_jit" "$s_lock"; do
+        case "$s" in crit) panel_status="crit" ;;
+                     warn) [[ "$panel_status" != "crit" ]] && panel_status="warn" ;;
+                     idle) [[ "$panel_status" == "ok" ]] && panel_status="idle" ;;
+        esac
+    done
+
+    local rail; rail=$(color_for_status "$panel_status")
+    local spark; spark=$(spark_values "$STATE_DIR/poh_service" 1 60)
+    local spark_str; spark_str=$(sparkline "$spark" 140 100 1)
+
+    panel_header "PoH HEALTH" "$panel_status" "$spark_str" "src=$source"
+    panel_row "$rail" "Tick rate"   "$rate"    "/sec" "$s_rate"  "target ≥160, panic <140"
+    panel_row "$rail" "Tick CV"     "$jit"     "%"    "$s_jit"   "jitter; ≤5% healthy"
+    panel_row "$rail" "Lock avg"    "$lock_us" "µs"   "$s_lock"  "contention; <2000 healthy"
+    panel_row "$rail" "Record avg"  "$rec_us"  "µs"   "$s_rec"   "only active when leading"
+    panel_help "$rail" "poh" "The PoH heartbeat — a SHA-256 chain that produces the verifiable
+clock pacing every slot. If PoH stutters, slot timing fails and skips
+follow within seconds.
+
+  Tick rate    Target ≥160/sec. Below 140 means CPU starved.
+  Tick CV      ≤5% is healthy jitter. >10% means thread preemption.
+  Lock avg     <2000µs is healthy. >10000µs is severe contention.
+  Record avg   Only non-zero when you are leading. Idle is normal.
+
+If CRIT: pin PoH to its own core, disable irqbalance, set CPU
+governor=performance, isolate via isolcpus=N in grub."
+    panel_footer "$rail"
+}
+
+# ---- 2. POH SLOT FILL -----------------------------------------------------
+draw_poh_slot_timing() {
+    local n; n=$(wc -l < "$STATE_DIR/poh_slot_timing" 2>/dev/null || echo 0)
+    if (( n < 1 )); then
+        local rail="$C_DIM"
+        panel_header "POH SLOT FILL" "idle" "$(sparkline '' )" "no data yet"
+        panel_text "$rail" "${C_DIM}waiting for poh_slot_timing datapoint…${C_RST}"
+        panel_footer "$rail"
+        return
+    fi
+    local last_fill avg_fill max_fill near
+    last_fill=$(tail -1 "$STATE_DIR/poh_slot_timing" | awk '{print $2}')
+    avg_fill=$(avg_recent "$STATE_DIR/poh_slot_timing" 60 1)
+    max_fill=$(max_recent "$STATE_DIR/poh_slot_timing" 60 1)
+    near=$(pct_above "$STATE_DIR/poh_slot_timing" 60 1 $((BUDGET_MS*80/100)))
+
+    local s_last s_max s_near
+    s_last=$(status_for_value "$last_fill" $((BUDGET_MS*80/100)) "$BUDGET_MS")
+    s_max=$(status_for_value  "$max_fill"  1000 2000)
+    s_near=$(status_for_value "$near"      40 70)
+
+    local panel_status="$s_last"
+    [[ "$s_max"  == "crit" ]] && panel_status="crit"
+    [[ "$s_near" == "crit" ]] && panel_status="crit"
+    [[ "$panel_status" != "crit" && "$s_near" == "warn" ]] && panel_status="warn"
+
+    local rail; rail=$(color_for_status "$panel_status")
+    local spark; spark=$(spark_values "$STATE_DIR/poh_slot_timing" 1 60)
+    local spark_str; spark_str=$(sparkline "$spark" $((BUDGET_MS*80/100)) "$BUDGET_MS")
+
+    panel_header "POH SLOT FILL" "$panel_status" "$spark_str" "budget=${BUDGET_MS}ms"
+    panel_row "$rail" "Last"        "$last_fill" "ms" "$s_last" "most recent slot fill"
+    panel_row "$rail" "Avg/60s"     "$avg_fill"  "ms" "ok"      "rolling 1-min average"
+    panel_row "$rail" "Peak/60s"    "$max_fill"  "ms" "$s_max"  "worst in last minute"
+    panel_row "$rail" "Near-budget" "$near"      "%"  "$s_near" "slots >80% budget"
+    panel_help "$rail" "slot_fill" "Time taken to fill a slot you are producing. The single most
+predictive metric for skip risk.
+
+  Last/Avg     Healthy: <320ms. Critical: ≥400ms (missed budget).
+  Peak/60s     One spike to >1000ms is a snapshot or upstream burst.
+  Near-budget  Over 60% means you are routinely close to the cliff
+               and will skip when CPU hiccups.
+
+If CRIT: this is your validator missing budget. Check the SYSTEM
+panel for CPU saturation, the SNAPSHOT panel for active stalls, and
+the BLOCK PRODUCTION panel for actual skip rate."
+    panel_footer "$rail"
+}
+
+# ---- 3. SLOT TIMING (replay) ----------------------------------------------
+draw_slot_timing() {
+    local n; n=$(wc -l < "$STATE_DIR/slot_duration" 2>/dev/null || echo 0)
+    if (( n < 1 )); then
+        local rail="$C_DIM"
+        panel_header "SLOT REPLAY" "idle" "$(sparkline '' )" "no data yet"
+        panel_text "$rail" "${C_DIM}waiting for replay-slot-stats datapoint…${C_RST}"
+        panel_footer "$rail"
+        return
+    fi
+    local last_dur peak near
+    last_dur=$(tail -1 "$STATE_DIR/slot_duration" | awk '{printf "%.0f", $3/1000}')
+    peak=$(max_recent "$STATE_DIR/slot_duration" 60 2)
+    peak=$((peak/1000))
+    near=$(pct_above "$STATE_DIR/slot_duration" 60 2 $((BUDGET_MS*1000*80/100)))
+
+    local s_last s_peak s_near
+    s_last=$(status_for_value "$last_dur" $((BUDGET_MS*80/100)) "$BUDGET_MS")
+    s_peak=$(status_for_value "$peak"     1000 2000)
+    s_near=$(status_for_value "$near"     40 70)
+
+    local panel_status="$s_last"
+    [[ "$s_peak" == "crit" ]] && panel_status="crit"
+    [[ "$s_near" == "crit" ]] && panel_status="crit"
+    [[ "$panel_status" != "crit" && "$s_near" == "warn" ]] && panel_status="warn"
+
+    local rail; rail=$(color_for_status "$panel_status")
+    local spark; spark=$(spark_values "$STATE_DIR/slot_duration" 2 60)
+    local spark_str; spark_str=$(sparkline "$spark" $((BUDGET_MS*1000*80/100)) $((BUDGET_MS*1000)))
+
+    panel_header "SLOT REPLAY" "$panel_status" "$spark_str" "budget=${BUDGET_MS}ms"
+    panel_row "$rail" "Last replay" "$last_dur" "ms" "$s_last" "time to replay other leader's slot"
+    panel_row "$rail" "Peak/60s"    "$peak"     "ms" "$s_peak" "worst replay in last minute"
+    panel_row "$rail" "Near-budget" "$near"     "%"  "$s_near" "replays >80% budget"
+    panel_help "$rail" "replay" "Time you take to validate someone else's slot. Different from
+POH SLOT FILL (which measures your own production).
+
+  Last/Peak    A spike here can be upstream (heavy block from the
+               current leader) OR your own AccountsDB stalling.
+               Cross-reference with SNAPSHOT STATE to disambiguate.
+  Near-budget  Healthy validators stay under 30%. X1 mainnet often
+               runs 50-70% during heavy network load — not your fault.
+
+If CRIT and SNAPSHOT shows active: it's snapshot stall, will pass.
+If CRIT and SNAPSHOT idle: investigate CPU/disk."
+    panel_footer "$rail"
+}
+
+# ---- 4. BLOCK PRODUCTION --------------------------------------------------
+draw_blocks_produced() {
+    local n; n=$(wc -l < "$STATE_DIR/blocks_produced" 2>/dev/null || echo 0)
+    if (( n < 2 )); then
+        local rail="$C_DIM"
+        panel_header "BLOCK PRODUCTION" "idle" "$(sparkline '' )" "no data yet"
+        panel_text "$rail" "${C_DIM}waiting for blocks_produced datapoint…${C_RST}"
+        panel_footer "$rail"
+        return
+    fi
+    local last_prod last_drop first_prod first_drop dprod ddrop
+    read -r _ last_prod last_drop < <(tail -1 "$STATE_DIR/blocks_produced")
+    read -r _ first_prod first_drop < <(head -1 "$STATE_DIR/blocks_produced")
+    dprod=$(( last_prod - first_prod ))
+    ddrop=$(( last_drop - first_drop ))
+
+    local life_pct=0 recent_pct=0
+    if awk -v p="$last_prod" -v d="$last_drop" 'BEGIN{exit !(p+d > 0)}'; then
+        life_pct=$(awk -v p="$last_prod" -v d="$last_drop" \
+            'BEGIN{printf "%.2f", 100*d/(p+d)}')
+    fi
+    if awk -v p="$dprod" -v d="$ddrop" 'BEGIN{exit !(p+d > 0)}'; then
+        recent_pct=$(awk -v p="$dprod" -v d="$ddrop" \
+            'BEGIN{printf "%.2f", 100*d/(p+d)}')
+    fi
+
+    local s_life s_recent
+    s_life=$(status_for_value   "$life_pct"   1.5 4)
+    s_recent=$(status_for_value "$recent_pct" 1.5 4)
+
+    local panel_status="$s_recent"
+    [[ "$s_life" == "crit" ]] && panel_status="crit"
+
+    local rail; rail=$(color_for_status "$panel_status")
+    local spark_str; spark_str=$(sparkline "")  # block production is event-driven, no time series
+
+    panel_header "BLOCK PRODUCTION" "$panel_status" "$spark_str" "your validator's actual skip rate"
+    panel_row "$rail" "Lifetime"  "$life_pct"   "%"  "$s_life"   "produced=$last_prod  dropped=$last_drop"
+    panel_row "$rail" "Recent"    "$recent_pct" "%"  "$s_recent" "produced=$dprod  dropped=$ddrop"
+    panel_help "$rail" "blocks" "The actual outcome metric. How often your validator produced
+its scheduled block vs dropped it.
+
+  Lifetime     Cumulative since validator process started.
+  Recent       Since this sentinel run started. Compare to lifetime
+               to see if you are improving or degrading.
+
+  <0.5%   Excellent
+  0.5-1%  Good
+  1-3%    Concerning — investigate
+  >3%     Bad — something is broken
+
+This is the only metric that directly measures revenue impact."
+    panel_footer "$rail"
+}
+
+# ---- 5. BANKING STAGE -----------------------------------------------------
+draw_banking() {
+    local rxr drr drop_pct consr buffered fwdr
+    rxr=$(rate_from_counter "$STATE_DIR/banking_tx" 30 1)
+    drr=$(rate_from_counter "$STATE_DIR/banking_tx" 30 2)
+    consr=$(rate_from_counter "$STATE_DIR/banking_tx" 30 3)
+    buffered=$(avg_recent    "$STATE_DIR/banking_tx" 30 4)
+    fwdr=$(rate_from_counter "$STATE_DIR/banking_tx" 30 5)
+    drop_pct=0
+    if awk -v r="$rxr" -v d="$drr" 'BEGIN{exit !(r+d > 0)}'; then
+        drop_pct=$(awk -v r="$rxr" -v d="$drr" 'BEGIN{printf "%.1f", 100*d/(r+d)}')
+    fi
+
+    local leading="(idle)"
+    if awk -v c="$consr" 'BEGIN{exit !(c > 0)}'; then
+        leading="(LEADING)"
+    fi
+
+    # When idle, drop% is normal load-shedding — not a real signal
+    local s_drop s_buffered
+    if [[ "$leading" == "(idle)" ]]; then
+        s_drop="idle"
+    else
+        s_drop=$(status_for_value "$drop_pct" 1 5)
+    fi
+    s_buffered=$(status_for_value "$buffered" 500 2000)
+
+    local panel_status="ok"
+    [[ "$s_drop" == "crit" || "$s_buffered" == "crit" ]] && panel_status="crit"
+    [[ "$panel_status" != "crit" && ("$s_drop" == "warn" || "$s_buffered" == "warn") ]] && panel_status="warn"
+    [[ "$panel_status" == "ok" && "$leading" == "(idle)" ]] && panel_status="idle"
+
+    local rail; rail=$(color_for_status "$panel_status")
+    local spark; spark=$(spark_values "$STATE_DIR/banking_tx" 1 60)
+    local spark_str; spark_str=$(sparkline "$spark")
+
+    panel_header "BANKING STAGE" "$panel_status" "$spark_str" "$leading"
+    panel_row "$rail" "Pkts/s in"   "$rxr"      "/s"  "ok"        "QUIC ingress rate"
+    panel_row "$rail" "Drop rate"   "$drop_pct" "%"   "$s_drop"   "only matters when leading"
+    panel_row "$rail" "Consumed/s"  "$consr"    "/s"  "ok"        "transactions processed"
+    panel_row "$rail" "Buffered"    "$buffered" ""    "$s_buffered" "queue depth (backpressure)"
+    panel_row "$rail" "Forwarded/s" "$fwdr"     "/s"  "ok"        "forwarded to next leader"
+    panel_help "$rail" "banking" "Transaction processing pipeline. Behavior differs based on
+whether you are currently producing a block.
+
+  (idle)       Most metrics near zero. Drops are normal load-shedding.
+  (LEADING)    Now drops and queue depth matter.
+
+  Drop rate    <1% leading is good. >5% leading means banking can't
+               keep up — CPU or scheduler bottleneck.
+  Buffered     <500 normal. >2000 means backpressure forming.
+  Consumed/s   Should match Pkts/s in minus drops when leading.
+
+If CRIT while leading: you are dropping transactions inside your
+own block. Check CPU per-core and lock contention."
+    panel_footer "$rail"
+}
+
+# ---- 6. TPU / QUIC --------------------------------------------------------
+draw_tpu() {
+    local act tot thr fail samples last_ts age fresh
+    samples=$(wc -l < "$STATE_DIR/quic_conns" 2>/dev/null || echo 0)
+    if (( samples >= 1 )); then
+        read -r last_ts act tot thr fail < <(tail -1 "$STATE_DIR/quic_conns")
+        age=$(awk -v now="$(date +%s.%3N)" -v t="$last_ts" 'BEGIN{printf "%.0f", now-t}')
+        if (( age < 30 )); then fresh="${age}s ago"
+        else fresh="stale ${age}s"; fi
+    else
+        fresh="no data"
+    fi
+    local thr_rate fail_rate
+    thr_rate=$(rate_from_counter "$STATE_DIR/quic_conns" 60 3)
+    fail_rate=$(rate_from_counter "$STATE_DIR/quic_conns" 60 4)
+
+    local s_act s_thr s_fail
+    if (( samples == 0 )); then
+        s_act="idle"; s_thr="idle"; s_fail="idle"
+    else
+        s_act=$(status_for_value "${act:-0}" 1 1 1)  # zero conns is bad
+        s_thr=$(status_for_value "$thr_rate" 1 10)
+        s_fail=$(status_for_value "$fail_rate" 1 10)
+    fi
+
+    local panel_status="ok"
+    [[ "$s_thr" == "crit" || "$s_fail" == "crit" ]] && panel_status="crit"
+    [[ "$panel_status" != "crit" && ("$s_thr" == "warn" || "$s_fail" == "warn") ]] && panel_status="warn"
+    (( samples == 0 )) && panel_status="idle"
+
+    local rail; rail=$(color_for_status "$panel_status")
+    local spark_str; spark_str=$(sparkline "")
+
+    panel_header "TPU / QUIC" "$panel_status" "$spark_str" "$fresh"
+    if (( samples == 0 )); then
+        panel_text "$rail" "${C_DIM}waiting for quic_streamer_tpu datapoint…${C_RST}"
+    else
+        panel_row "$rail" "Active conns"  "${act:-0}"     ""    "$s_act"  "currently open QUIC connections"
+        panel_row "$rail" "Total attempts" "${tot:-0}"    ""    "ok"      "lifetime; should grow"
+        panel_row "$rail" "Throttled/s"   "$thr_rate"     "/s"  "$s_thr"  "rate-limit drops"
+        panel_row "$rail" "Setup-timeouts/s" "$fail_rate" "/s"  "$s_fail" "handshake failures"
+    fi
+    panel_help "$rail" "tpu" "Network ingress to the validator. The first stage of the
+transaction pipeline.
+
+  Active conns       Healthy: 50-500 depending on stake and traffic.
+                     Sudden drop to zero: firewall or ISP issue.
+  Throttled/s        0 is good. >10/s means you're shedding load at
+                     the door. Increase QUIC limits or scale up.
+  Setup-timeouts/s   Any sustained non-zero rate indicates network
+                     latency or firewall problems.
+
+If you see throttling under high stake: increase the validator's
+QUIC stream limits or upgrade host network capacity."
+    panel_footer "$rail"
+}
+
+# ---- 7. BLOCK LOAD --------------------------------------------------------
+draw_cost_tracker() {
+    local n; n=$(wc -l < "$STATE_DIR/cost_tracker" 2>/dev/null || echo 0)
+    if (( n < 1 )); then return; fi
+    local last_ts bcost vcost txc nacct age fresh
+    last_ts=$(tail -1 "$STATE_DIR/cost_tracker" | awk '{print $1}')
+    bcost=$(tail -1 "$STATE_DIR/cost_tracker" | awk '{print ($2+0)}')
+    vcost=$(tail -1 "$STATE_DIR/cost_tracker" | awk '{print ($3+0)}')
+    txc=$(tail -1 "$STATE_DIR/cost_tracker"   | awk '{print ($4+0)}')
+    nacct=$(tail -1 "$STATE_DIR/cost_tracker" | awk '{print ($5+0)}')
+    age=$(awk -v now="$(date +%s.%3N)" -v t="$last_ts" 'BEGIN{printf "%.0f", now-t}')
+    if (( age < 10 )); then fresh="${age}s ago"
+    else fresh="stale ${age}s"; fi
+    local pct=0
+    [[ "$bcost" -gt 0 ]] && pct=$(( bcost*100/48000000 ))
+
+    local s_pct
+    s_pct=$(status_for_value "$pct" 75 90)
+
+    local panel_status="$s_pct"
+    local rail; rail=$(color_for_status "$panel_status")
+    local spark; spark=$(spark_values "$STATE_DIR/cost_tracker" 1 60)
+    local spark_str; spark_str=$(sparkline "$spark" 36000000 43200000)
+
+    panel_header "BLOCK LOAD" "$panel_status" "$spark_str" "$fresh"
+    panel_row "$rail" "Compute"     "$bcost"  "CU"   "$s_pct" "${pct}% of 48M cap"
+    panel_row "$rail" "Transactions" "$txc"   ""     "ok"      "tx count in slot"
+    panel_row "$rail" "Accounts"    "$nacct"  ""     "ok"      "unique accounts touched"
+    panel_row "$rail" "Vote CU"     "$vcost"  "CU"   "ok"      "compute spent on votes"
+    panel_help "$rail" "cost" "What the most recent slot contained. Useful for spotting heavy
+network load conditions.
+
+  <10%      Light. Normal background traffic.
+  10-75%    Moderate.
+  75-90%    Heavy. Block is filling up.
+  >90%      Saturated. Transactions being dropped at the door.
+
+A consistently saturated CU pattern means the network is under
+heavy load. Your validator is fine; the network is busy."
+    panel_footer "$rail"
+}
+
+# ---- 8. ACCOUNTSDB --------------------------------------------------------
+draw_accounts() {
+    local store flush snap_max
+    store=$(avg_recent "$STATE_DIR/accounts_store" 60 1)
+    flush=$(avg_recent "$STATE_DIR/accounts_store" 60 2)
+    snap_max=$(max_recent "$STATE_DIR/snapshots" 300 1)
+    snap_max=$((snap_max/1000))
+
+    local s_store s_snap
+    s_store=$(status_for_value "$store" 100 1000)
+    s_snap=$(status_for_value  "$snap_max" 2000 10000)
+
+    local panel_status="$s_store"
+    [[ "$s_snap" == "crit" ]] && panel_status="crit"
+    [[ "$panel_status" != "crit" && "$s_snap" == "warn" ]] && panel_status="warn"
+
+    local rail; rail=$(color_for_status "$panel_status")
+    local spark; spark=$(spark_values "$STATE_DIR/accounts_store" 1 60)
+    local spark_str; spark_str=$(sparkline "$spark" 100 1000)
+
+    panel_header "ACCOUNTSDB" "$panel_status" "$spark_str" "on-disk account state"
+    panel_row "$rail" "Store avg"    "$store"    "µs" "$s_store" "<100µs healthy"
+    panel_row "$rail" "Flush avg"    "$flush"    "µs" "ok"       "dirty page flush time"
+    panel_row "$rail" "Snapshot peak" "$snap_max" "ms" "$s_snap"  "worst snapshot in last 5m"
+    panel_help "$rail" "accounts" "On-disk account state store. Most critical IO subsystem.
+
+  Store avg      <100µs healthy. >1000µs means disk contention.
+                 >50000µs almost certainly means a snapshot is running.
+  Flush avg      Spikes correlate with snapshots and disk pressure.
+  Snapshot peak  >10s is critical. Move snapshots to tmpfs or a
+                 separate disk to fix.
+
+If CRIT during snapshot windows but otherwise healthy: snapshot
+config tuning needed (see SNAPSHOT STATE help)."
+    panel_footer "$rail"
+}
+
+# ---- 9. SNAPSHOT STATE ----------------------------------------------------
+draw_snapshot_status() {
+    local r state s_color db ab sb wkb adb_rate evts
+    r=$(detect_snapshot_state)
+    state=$(cut -d'|' -f1 <<<"$r")
+    db=$(cut -d'|' -f3 <<<"$r")
+    ab=$(cut -d'|' -f4 <<<"$r")
+    sb=$(cut -d'|' -f5 <<<"$r")
+    wkb=$(cut -d'|' -f6 <<<"$r")
+    adb_rate=$(cut -d'|' -f7 <<<"$r")
+    evts=$(cut -d'|' -f8 <<<"$r")
+
+    local panel_status
+    case "$state" in
+        idle)        panel_status="ok" ;;
+        building)    panel_status="ok" ;;
+        in-progress) panel_status="warn" ;;
+        active)      panel_status="warn" ;;
+    esac
+
+    local last_snap_age="never"
+    if [[ -s "$STATE_DIR/snapshot_events" ]]; then
+        local last_ts age
+        last_ts=$(tail -1 "$STATE_DIR/snapshot_events" | awk '{print $1}')
+        age=$(awk -v now="$(date +%s.%3N)" -v t="$last_ts" 'BEGIN{printf "%.0f", now-t}')
+        if   (( age < 60 ));   then last_snap_age="${age}s ago"
+        elif (( age < 3600 )); then last_snap_age="$((age/60))m ago"
+        else last_snap_age="$((age/3600))h ago"; fi
+    fi
+
+    local last_dur="—"
+    if [[ -s "$STATE_DIR/snapshots" ]]; then
+        last_dur=$(tail -1 "$STATE_DIR/snapshots" | awk '{printf "%.0fms", $2/1000}')
+    fi
+
+    local rail; rail=$(color_for_status "$panel_status")
+    local spark_str; spark_str=$(sparkline "")
+
+    panel_header "SNAPSHOT STATE" "$panel_status" "$spark_str" "phase: $state"
+
+    local sig_line=""
+    [[ "$db" == "1" ]] && sig_line+="${C_RED}● disk${C_RST}  " || sig_line+="${C_DIM}· disk${C_RST}  "
+    [[ "$ab" == "1" ]] && sig_line+="${C_RED}● adb${C_RST}  "  || sig_line+="${C_DIM}· adb${C_RST}  "
+    [[ "$sb" == "1" ]] && sig_line+="${C_RED}● snap${C_RST}"   || sig_line+="${C_DIM}· snap${C_RST}"
+    panel_text "$rail" "Signals: $sig_line"
+    panel_text "$rail" "${C_DIM}wkB/s=${wkb}  adb-rate=${adb_rate}/s  recent-events=${evts}${C_RST}"
+    panel_text "$rail" "Last event: $last_snap_age   Last duration: $last_dur"
+    panel_help "$rail" "snapshot" "Aggregate detector for 'is a snapshot happening right now?'
+Three independent signals must agree.
+
+  idle         Nothing snapshot-related happening. Baseline.
+  building     One signal active. Could be coincidence.
+  in-progress  Two signals active. Snapshot starting or finishing.
+  active       All three firing. Snapshot in mid-flight.
+
+When in-progress or active, the risk score automatically dampens
+timing-related contributors so you don't get false CRIT alarms
+during normal snapshot windows.
+
+Tuning to reduce snapshot stalls:
+  --full-snapshot-interval-slots 200000
+  --incremental-snapshot-interval-slots 1000
+  --snapshots /dev/shm/snapshots    (snapshots in tmpfs)
+  --accounts-db-cache-limit-mb 16000  (was 100000)"
+    panel_footer "$rail"
+}
+
+# ---- 10. SHREDS / TURBINE -------------------------------------------------
+draw_turbine() {
+    local rep_max recov_max l1_avg l2_avg
+    rep_max=$(max_recent "$STATE_DIR/slot_complete" 60 2)
+    recov_max=$(max_recent "$STATE_DIR/slot_complete" 60 3)
+    l1_avg=$(avg_recent "$STATE_DIR/turbine" 60 1)
+    l2_avg=$(avg_recent "$STATE_DIR/turbine" 60 2)
+
+    local s_repairs
+    s_repairs=$(status_for_value "$rep_max" 50 200)
+
+    local panel_status="$s_repairs"
+    local rail; rail=$(color_for_status "$panel_status")
+    local spark; spark=$(spark_values "$STATE_DIR/slot_complete" 2 60)
+    local spark_str; spark_str=$(sparkline "$spark" 50 200)
+
+    panel_header "SHREDS / TURBINE" "$panel_status" "$spark_str" "block propagation"
+    panel_row "$rail" "Repairs peak"  "$rep_max"   ""  "$s_repairs" "shreds requested from peers"
+    panel_row "$rail" "Recovered peak" "$recov_max" "" "ok"          "erasure-coded recoveries"
+    panel_row "$rail" "Turbine 1st"   "$l1_avg"    ""  "ok"          "direct from leader"
+    panel_row "$rail" "Turbine 2nd"   "$l2_avg"    ""  "ok"          "retransmit layer"
+    panel_help "$rail" "turbine" "Block propagation health. Shreds are the small chunks blocks
+get split into for network distribution.
+
+  Repairs       Shreds you needed to request from peers because
+                Turbine fast-path missed them.
+                <50 healthy, 50-200 warning, >200 problem.
+  Recovered     Erasure-coded recoveries. Some is normal even
+                healthy; >2000 means poor primary delivery.
+  Turbine 1/2   Most shreds should arrive via fast-path layers.
+                Heavy reliance on repairs = stake or peering issue.
+
+If repairs are persistently high: check your peering, gossip
+health, and stake-weighted Turbine tree position."
+    panel_footer "$rail"
+}
+
+# ---- 11. SYSTEM -----------------------------------------------------------
+draw_system() {
+    local cpu_top loadavg mem netd nvme hb age
+    cpu_top=$(cat "$STATE_DIR/cpu_top"      2>/dev/null)
+    loadavg=$(cat "$STATE_DIR/loadavg"      2>/dev/null)
+    mem=$(cat "$STATE_DIR/ram_info"         2>/dev/null)
+    netd=$(cat "$STATE_DIR/net_drops"       2>/dev/null)
+    nvme=$(cat "$STATE_DIR/nvme_io"         2>/dev/null)
+    hb=$(cat "$STATE_DIR/sys_heartbeat"     2>/dev/null)
+
+    local hb_str="dead"
+    if [[ -n "$hb" ]]; then
+        age=$(( $(date +%s) - hb ))
+        if (( age < 10 )); then hb_str="alive ${age}s ago"
+        else hb_str="stale ${age}s"; fi
+    fi
+
+    # Compute load saturation
+    local load1 ncpu sat_pct=0
+    if [[ -n "$loadavg" ]]; then
+        load1=$(awk -F'[= ]' '{for(i=1;i<=NF;i++)if($i=="load1"){print $(i+1);exit}}' <<<"$loadavg")
+        ncpu=$(awk -F'[= ]' '{for(i=1;i<=NF;i++)if($i=="ncpu"){print $(i+1);exit}}' <<<"$loadavg")
+        if [[ -n "$load1" && -n "$ncpu" ]] && awk -v n="$ncpu" 'BEGIN{exit !(n>0)}'; then
+            sat_pct=$(awk -v l="$load1" -v n="$ncpu" 'BEGIN{printf "%.0f", 100*l/n}')
+        fi
+    fi
+    local s_load
+    s_load=$(status_for_value "$sat_pct" 60 80)
+
+    local panel_status="$s_load"
+    [[ "$hb_str" == "dead" || "$hb_str" =~ stale ]] && panel_status="warn"
+
+    local rail; rail=$(color_for_status "$panel_status")
+    local spark_str; spark_str=$(sparkline "")
+
+    panel_header "SYSTEM" "$panel_status" "$spark_str" "collector $hb_str"
+    if [[ -n "$loadavg" ]]; then
+        panel_row "$rail" "Load (1m)" "$load1" "" "$s_load" "${sat_pct}% of $ncpu cores"
+    fi
+    panel_text "$rail" "${C_DIM}CPU hot:${C_RST}  ${cpu_top:-collecting…}"
+    panel_text "$rail" "${C_DIM}RAM:    ${C_RST}  ${mem:-collecting…}"
+    panel_text "$rail" "${C_DIM}Net:    ${C_RST}  ${netd:-collecting…}"
+    if [[ "$nvme" == "iostat-missing" ]]; then
+        panel_text "$rail" "${C_DIM}Disk:   ${C_RST}  ${C_DIM}install sysstat: apt install -y sysstat${C_RST}"
+    elif [[ -z "$nvme" ]]; then
+        panel_text "$rail" "${C_DIM}Disk:   ${C_RST}  collecting…"
+    else
+        panel_text "$rail" "${C_DIM}Disk $NVME_DEV:${C_RST}  $nvme"
+    fi
+    panel_help "$rail" "system" "Host-level metrics. Often the root cause of validator-level
+symptoms.
+
+  Load 1m      <50% × ncpu = healthy. >75% = CPU-bound, expect skips.
+  CPU hot      One core at 100% = PoH (normal). Multiple cores
+               >80% = banking/replay competing.
+  RAM mem%     Healthy: 40-70%. >90% = swap risk.
+  pgmajfault   Should grow slowly. Sudden jumps mean memory pressure
+               causing disk reads.
+  Disk         w_await<5ms excellent, >50ms stressed. util%<30 idle,
+               >80 saturated.
+
+If CPU is your bottleneck: pin PoH with isolcpus=, set governor=
+performance, disable irqbalance, give validator its own CPU set
+via systemd CPUAffinity."
+    panel_footer "$rail"
+}
+
+# ---- 12. DATA FLOW (diagnostic) -------------------------------------------
+draw_metrics_flow() {
+    local total uniq top
+    total=$(wc -l < "$STATE_DIR/metrics_seen" 2>/dev/null || echo 0)
+    if (( total == 0 )); then
+        local rail="$C_DIM"
+        panel_header "DATA FLOW" "idle" "$(sparkline '')" "diagnostic"
+        panel_text "$rail" "${C_DIM}no datapoint lines parsed yet — check SERVICE name${C_RST}"
+        panel_footer "$rail"
+        return
+    fi
+    uniq=$(sort -u "$STATE_DIR/metrics_seen" 2>/dev/null | wc -l)
+    top=$(sort "$STATE_DIR/metrics_seen" 2>/dev/null | uniq -c | sort -rn | head -4 \
+          | awk '{printf "%s(%s) ", $2, $1}')
+
+    local s_total
+    s_total=$(status_for_value "$total" 100 50 1)  # reverse: low is bad
+
+    local rail; rail=$(color_for_status "$s_total")
+    local spark_str; spark_str=$(sparkline "")
+
+    panel_header "DATA FLOW" "$s_total" "$spark_str" "diagnostic"
+    panel_row "$rail" "Events"  "$total" ""  "$s_total" "datapoint lines parsed"
+    panel_row "$rail" "Unique"  "$uniq"  ""  "ok"       "distinct metric names seen"
+    panel_text "$rail" "${C_DIM}top: ${top}${C_RST}"
+    panel_help "$rail" "flow" "Diagnostic panel showing the parser is alive and reading from
+journalctl. A healthy validator emits 95-110 unique metric names
+continuously.
+
+  Events    Should grow steadily. Stuck at 0 means parser can't read
+            the journal — check SERVICE name in config.
+  Unique    Number of distinct datapoint names. Use --list-metrics
+            to see the full breakdown.
+  top       Most frequently emitted datapoints, with counts.
+
+If Events=0: check 'journalctl -u <SERVICE> -n 1' works as your user."
+    panel_footer "$rail"
+}
+
+# ---- RISK PANEL (composite score) -----------------------------------------
+draw_risk() {
+    local r score level reasons col
+    r=$(compute_risk)
+    score=$(cut -d'|' -f1 <<<"$r")
+    level=$(cut -d'|' -f2 <<<"$r")
+    reasons=$(cut -d'|' -f3 <<<"$r")
+
+    local panel_status
+    case "$level" in
+        LOW)  panel_status="ok"   ;;
+        MED)  panel_status="warn" ;;
+        HIGH) panel_status="crit" ;;
+        CRIT) panel_status="crit" ;;
+    esac
+    local rail; rail=$(color_for_status "$panel_status")
+    local spark_str; spark_str=$(sparkline "")
+
+    panel_header "PRECOGNITIVE RISK" "$panel_status" "$spark_str" "composite score"
+    panel_row "$rail" "Score" "$score" "" "$panel_status" "level=$level"
+    if [[ -n "$reasons" ]]; then
+        # Wrap reasons across multiple lines if needed
+        local reason_text="${C_DIM}drivers:${C_RST} $reasons"
+        panel_text "$rail" "$reason_text"
+    fi
+
+    # Log transitions
+    local prev
+    prev=$(tail -1 "$STATE_DIR/risk_log" 2>/dev/null | awk '{print $2}')
+    if [[ "$prev" != "$level" ]]; then
+        echo "$(date '+%H:%M:%S') $level $score $reasons" >> "$STATE_DIR/risk_log"
+        if [[ "$level" == "HIGH" || "$level" == "CRIT" ]]; then
+            if declare -F alert_send >/dev/null; then
+                alert_send "$level" "Risk → $level (score $score)" "$reasons"
+            elif [[ -n "${TG_TOKEN:-}" && -n "${TG_CHAT:-}" ]]; then
+                curl -s "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+                    -d "chat_id=${TG_CHAT}" \
+                    -d "text=⚠️ X1 ${HOST}: risk → ${level} (score ${score}). ${reasons}" \
+                    >/dev/null 2>&1 &
+            fi
+        fi
+    fi
+
+    if [[ -s "$STATE_DIR/risk_log" ]]; then
+        panel_text "$rail" "${C_DIM}recent transitions:${C_RST}"
+        tail -3 "$STATE_DIR/risk_log" | while read -r line; do
+            panel_text "$rail" "  ${C_DIM}${line}${C_RST}"
+        done
+    fi
+
+    panel_help "$rail" "risk" "Composite score. Reads every panel above and produces one
+weighted number. Each contributor capped at 30 so no single bad
+metric pegs the score.
+
+  LOW  (0-25)   Healthy. Just watch.
+  MED  (26-55)  One subsystem degrading. Investigate listed driver.
+  HIGH (56-90)  Multiple stress signals. Likely already missing slots.
+                Telegram/Discord fires here.
+  CRIT (91+)    Active failure or imminent skip burst.
+
+Drivers list shows which subsystems contributed and their actual
+values. Read this first when score is elevated — it tells you
+exactly what to investigate."
+    panel_footer "$rail"
+}
+
+# ============================================================================
+#                        LIST-METRICS MODE
+# ============================================================================
+# Runs journalctl in the foreground for N seconds and prints every datapoint
+# name observed, sorted by frequency. This is the surface I need to see in
+# order to wire up panels that don't match upstream Agave names.
+run_list_metrics() {
+    local secs="${1:-90}"
+    echo "Tailing $SERVICE for ${secs}s. Counting datapoint names…"
+    local tmp; tmp=$(mktemp)
+    timeout "$secs" journalctl -u "$SERVICE" -f --no-pager -o cat 2>/dev/null \
+        | grep -oE 'datapoint:[[:space:]]+[a-zA-Z][a-zA-Z0-9_-]+' \
+        | awk '{print $NF}' \
+        > "$tmp"
+    local total uniq
+    total=$(wc -l < "$tmp")
+    uniq=$(sort -u "$tmp" | wc -l)
+    echo
+    echo "==== summary ===="
+    echo "total datapoint events: $total"
+    echo "unique metric names:    $uniq"
+    echo
+    echo "==== full list (count, name) ===="
+    sort "$tmp" | uniq -c | sort -rn
+    echo
+    echo "==== fields per metric (one sample line per name) ===="
+    timeout 30 journalctl -u "$SERVICE" -f --no-pager -o cat 2>/dev/null \
+        | grep --line-buffered -oE 'datapoint:[[:space:]]+[a-zA-Z][a-zA-Z0-9_-]+[^[:cntrl:]]+' \
+        | awk '
+            { name=$2; sub(/^datapoint:[[:space:]]+/,""); if(!seen[name]++) print }
+            END { exit 0 }' &
+    local samp_pid=$!
+    sleep 30
+    kill "$samp_pid" 2>/dev/null
+    rm -f "$tmp"
+}
+
+# ============================================================================
+self_check() {
+    printf '%b── X1 Sentinel startup check ──%b\n' "$C_BLD$C_CYN" "$C_RST"
+
+    # Config files loaded
+    if [[ -n "$CONF_LOADED" ]]; then
+        printf '  %b✓%b Config:   %s\n' "$C_GRN" "$C_RST" "$CONF_LOADED"
+    else
+        printf '  %b!%b Config:   no sentinel.conf found in any search path\n' "$C_YEL" "$C_RST"
+    fi
+
+    # Service
+    if systemctl status "$SERVICE" >/dev/null 2>&1; then
+        printf '  %b✓%b Service:  %s\n' "$C_GRN" "$C_RST" "$SERVICE"
+    else
+        printf '  %b✗%b Service:  %s  %b(not running, journalctl will be empty)%b\n' \
+            "$C_RED" "$C_RST" "$SERVICE" "$C_DIM" "$C_RST"
+    fi
+
+    # Identity
+    if [[ "$MY_PUBKEY" == "unknown" || ${#MY_PUBKEY} -lt 32 ]]; then
+        if [[ -f "$IDENTITY" ]]; then
+            printf '  %b✗%b Identity: %s exists but solana-keygen failed   %b(set PUBKEY=… to override)%b\n' \
+                "$C_RED" "$C_RST" "$IDENTITY" "$C_DIM" "$C_RST"
+        else
+            printf '  %b✗%b Identity: %s not readable   %b(set PUBKEY=… or fix path)%b\n' \
+                "$C_RED" "$C_RST" "$IDENTITY" "$C_DIM" "$C_RST"
+        fi
+    else
+        printf '  %b✓%b Identity: %s\n' "$C_GRN" "$C_RST" "${MY_PUBKEY:0:8}…${MY_PUBKEY: -4}"
+    fi
+
+    # Local RPC
+    local lrs
+    lrs=$(timeout 2 curl -s -X POST -H 'Content-Type: application/json' \
+        -d '{"jsonrpc":"2.0","id":1,"method":"getSlot"}' "$RPC_URL" 2>/dev/null \
+        | grep -oE '"result":[0-9]+' | cut -d: -f2)
+    if [[ -n "$lrs" ]]; then
+        printf '  %b✓%b Local RPC %s  slot=%s\n' "$C_GRN" "$C_RST" "$RPC_URL" "$lrs"
+    else
+        printf '  %b✗%b Local RPC %s  no response\n' "$C_RED" "$C_RST" "$RPC_URL"
+    fi
+
+    # Cluster RPC
+    local crs
+    crs=$(timeout 3 curl -s -X POST -H 'Content-Type: application/json' \
+        -d '{"jsonrpc":"2.0","id":1,"method":"getSlot"}' "$CLUSTER_RPC" 2>/dev/null \
+        | grep -oE '"result":[0-9]+' | cut -d: -f2)
+    if [[ -n "$crs" ]]; then
+        printf '  %b✓%b Cluster RPC %s  slot=%s\n' "$C_GRN" "$C_RST" "$CLUSTER_RPC" "$crs"
+    else
+        printf '  %b✗%b Cluster RPC %s  no response   %b(drift will be unreliable)%b\n' \
+            "$C_RED" "$C_RST" "$CLUSTER_RPC" "$C_DIM" "$C_RST"
+    fi
+
+    # NVMe
+    if [[ -b "/dev/$NVME_DEV" ]]; then
+        printf '  %b✓%b NVMe:     /dev/%s\n' "$C_GRN" "$C_RST" "$NVME_DEV"
+    else
+        printf '  %b✗%b NVMe:     /dev/%s not found\n' "$C_RED" "$C_RST" "$NVME_DEV"
+    fi
+
+    # iostat
+    if command -v iostat >/dev/null 2>&1; then
+        printf '  %b✓%b iostat:   present\n' "$C_GRN" "$C_RST"
+    else
+        printf '  %b!%b iostat:   missing   %b(apt install sysstat)%b\n' \
+            "$C_YEL" "$C_RST" "$C_DIM" "$C_RST"
+    fi
+
+    # journalctl access
+    if timeout 2 journalctl -u "$SERVICE" -n 1 --no-pager >/dev/null 2>&1; then
+        printf '  %b✓%b journalctl readable\n' "$C_GRN" "$C_RST"
+    else
+        printf '  %b✗%b journalctl: cannot read %s   %b(add user to systemd-journal group)%b\n' \
+            "$C_RED" "$C_RST" "$SERVICE" "$C_DIM" "$C_RST"
+    fi
+
+    echo
+}
+run_dashboard() {
+    self_check
+    printf '%bstarting in 2s — Ctrl-C to abort%b\n' "$C_DIM" "$C_RST"
+    sleep 2
+
+    # Show capybara splash for ~3 seconds (or until key pressed)
+    show_splash 3
+
+    init_state
+    log_parser    & BG_PIDS+=($!)
+    rpc_watcher   & BG_PIDS+=($!)
+    sys_collector & BG_PIDS+=($!)
+    nvme_collector & BG_PIDS+=($!)
+
+    tput civis 2>/dev/null
+
+    # Help overlay state (cycles through panels with ?)
+    local help_overlay=""
+    declare -A panel_help_keys=(
+        [1]="poh" [2]="slot_fill" [3]="replay" [4]="blocks"
+        [5]="banking" [6]="tpu" [7]="cost" [8]="accounts"
+        [9]="snapshot" [10]="turbine" [11]="system" [12]="flow" [13]="risk"
+    )
+
+    while :; do
+        clear
+        # Title bar with capybara branding
+        printf '%b┌─%b %bC A P Y B A R A%b %b·%b %bX1 validator sentinel%b  %b· made by Owl of Atena%b\n' \
+            "$C_CYN" "$C_RST" \
+            "$C_BLD$C_CYN" "$C_RST" \
+            "$C_DIM" "$C_RST" \
+            "$C_DIM" "$C_RST" \
+            "$C_DIM" "$C_RST"
+        draw_header
+        echo
+        if [[ -n "$help_overlay" ]]; then
+            show_full_help "$help_overlay"
+        else
+            # Two-column layout: pair related panels side by side.
+            # On terminals < 140 cols, fall back to single column.
+            local term_w=160
+            if command -v tput >/dev/null 2>&1; then
+                term_w=$(tput cols 2>/dev/null || echo 160)
+            fi
+
+            if (( term_w >= 140 )); then
+                render_two_columns draw_poh             draw_poh_slot_timing
+                render_two_columns draw_slot_timing     draw_blocks_produced
+                render_two_columns draw_banking         draw_tpu
+                render_two_columns draw_cost_tracker    draw_accounts
+                render_two_columns draw_snapshot_status draw_turbine
+                render_two_columns draw_system          draw_metrics_flow
+                echo
+                draw_risk
+            else
+                draw_poh
+                draw_poh_slot_timing
+                draw_slot_timing
+                draw_blocks_produced
+                draw_banking
+                draw_tpu
+                draw_cost_tracker
+                draw_accounts
+                draw_snapshot_status
+                draw_turbine
+                draw_system
+                draw_metrics_flow
+                echo
+                draw_risk
+            fi
+        fi
+        echo
+        # Footer with key hints
+        local dbg_lines=0
+        [[ -s "$STATE_DIR/debug.log" ]] && dbg_lines=$(wc -l < "$STATE_DIR/debug.log")
+        local hint_help="?"
+        [[ "$HELP_MODE" == "1" ]] && hint_help="${C_GRN}?${C_RST}"
+        if (( dbg_lines > 0 )); then
+            printf '%b  [%s] help · [h] toggle inline · [q] quit · refresh %ss   %berrors:%b %s%b\n' \
+                "$C_DIM" "$hint_help" "$REFRESH" "$C_YEL" "$C_RST" "$dbg_lines" "$C_RST"
+        else
+            printf '%b  [%s] help overlay · [h] inline help · [d] docs · [q] quit · refresh %ss%b\n' \
+                "$C_DIM" "$hint_help" "$REFRESH" "$C_RST"
+        fi
+
+        # Keypress handler — supports more than q now
+        read -t "$REFRESH" -n 1 key
+        case "$key" in
+            q) break ;;
+            h) [[ "$HELP_MODE" == "1" ]] && HELP_MODE=0 || HELP_MODE=1 ;;
+            "?") [[ -n "$help_overlay" ]] && help_overlay="" || help_overlay="all" ;;
+            d) help_overlay="all" ;;
+            *) [[ -n "$help_overlay" && -z "$key" ]] && help_overlay="" ;;
+        esac
+    done
+}
+
+# Full-screen help overlay listing every panel and what each value means.
+show_full_help() {
+    local which="${1:-all}"
+    printf '%b╭─ CAPYBARA HELP ─ press ? again or any key to return ──────────────╮%b\n' "$C_CYN" "$C_RST"
+    printf '%b│%b\n' "$C_CYN" "$C_RST"
+    printf '%b│%b  %bWhat each panel means and when to worry%b\n' "$C_CYN" "$C_RST" "$C_BLD" "$C_RST"
+    printf '%b│%b\n' "$C_CYN" "$C_RST"
+
+    local IFS=$'\n'
+    local block
+    block="${C_BLD}PoH HEALTH${C_RST}
+  Tick rate    target ≥160/sec. Below 140 means CPU starved.
+  Tick CV      ≤5% healthy jitter. >10% = thread preemption.
+  Lock avg     <2000µs healthy. >10000 = severe contention.
+  ${C_DIM}Fix: pin PoH to its own core via systemd CPUAffinity${C_RST}
+
+${C_BLD}POH SLOT FILL${C_RST}  ← most predictive metric for skips
+  How long it actually took to fill a slot YOU produce.
+  Healthy: <320ms. Critical: ≥400ms.
+  Near-budget over 60% means you'll skip when CPU hiccups.
+
+${C_BLD}SLOT REPLAY${C_RST}
+  Time to validate slots from OTHER leaders. Spikes can be
+  upstream pressure (heavy block) OR your AccountsDB stalling.
+  Cross-reference with SNAPSHOT STATE to disambiguate.
+
+${C_BLD}BLOCK PRODUCTION${C_RST}  ← actual outcome metric
+  Lifetime/Recent: dropped vs produced %.
+  <0.5% excellent, 0.5-1% good, 1-3% concerning, >3% bad.
+
+${C_BLD}BANKING STAGE${C_RST}  (LEADING vs idle)
+  When idle: drop% is normal load-shedding, ignore.
+  When LEADING: drop% >5% = scheduler bottleneck.
+  Buffered >2000 = backpressure forming.
+
+${C_BLD}TPU / QUIC${C_RST}
+  Active conns: 50-500 healthy. Sudden drop to 0 = network issue.
+  Throttled/s >10 = shedding load at the door.
+
+${C_BLD}BLOCK LOAD${C_RST}
+  Compute units in latest slot vs 48M cap. >90% = saturated network.
+  Your validator is fine; the network is busy.
+
+${C_BLD}ACCOUNTSDB${C_RST}
+  Store avg <100µs healthy. Snapshot peak >10s = stalling.
+  Fix: snapshots to tmpfs (--snapshots /dev/shm/snapshots).
+
+${C_BLD}SNAPSHOT STATE${C_RST}
+  idle / building / in-progress / active.
+  When active, risk score auto-dampens timing alerts.
+
+${C_BLD}SHREDS / TURBINE${C_RST}
+  Repairs: <50 healthy, 50-200 warn, >200 problem.
+  High repairs = peering or stake-tree issue.
+
+${C_BLD}SYSTEM${C_RST}
+  Load <50% × ncpu = healthy. >75% = CPU-bound, expect skips.
+  CPU hot: 1 core at 100% = PoH (normal).
+  Disk: w_await<5ms excellent, util%<30 idle.
+
+${C_BLD}DATA FLOW${C_RST}  (diagnostic)
+  Events should grow steadily. Stuck at 0 = parser can't read
+  journal. Check SERVICE name in config.
+
+${C_BLD}PRECOGNITIVE RISK${C_RST}
+  Composite score, capped at 30 per contributor.
+  LOW (0-25) MED (26-55) HIGH (56-90) CRIT (91+).
+  Telegram/Discord fires at HIGH and above.
+
+${C_DIM}For detailed reference: x1-sentinel --docs${C_RST}
+${C_DIM}For metric history:    x1-sentinel --history${C_RST}"
+    for line in $block; do
+        printf '%b│%b  %s\n' "$C_CYN" "$C_RST" "$line"
+    done
+    printf '%b│%b\n' "$C_CYN" "$C_RST"
+    printf '%b╰────────────────────────────────────────────────────────────────────╯%b\n' "$C_CYN" "$C_RST"
+}
+
+# ============================================================================
+#                              STREAM MODE (v10 behavior)
+# ============================================================================
+run_stream() {
+    printf '%b' "$C_CYN"
+    echo "══════════════════════════════════════════════════════════════════════════════"
+    echo "          X1 SENTINEL — STREAM MODE (v10 behavior)"
+    echo "══════════════════════════════════════════════════════════════════════════════"
+    printf '%b' "$C_RST"
+
+    local last_leader="unknown"
+    journalctl -u "$SERVICE" -f --no-pager | grep --line-buffered -E \
+        "slot_stats_tracking_complete|shred_fetch_repair|retransmit-stage-slot-stats|vote-processing-timing|banking_stage|receive_and_buffer_packets_count|dropped_packets_count|poh|tick|accounts_db_store_timings|current_leader|leader" \
+    | while read -r line; do
+        local slot; slot=$(grep -o 'slot=[0-9]*' <<<"$line" | cut -d= -f2 || echo "N/A")
+
+        if grep -qE '[1-9A-HJ-NP-Za-km-z]{32,44}' <<<"$line"; then
+            local cand
+            cand=$(grep -oE '[1-9A-HJ-NP-Za-km-z]{32,44}' <<<"$line" | head -1)
+            [[ "$cand" != "$MY_PUBKEY" && ${#cand} -gt 40 ]] && last_leader="$cand"
+        fi
+
+        if [[ "$line" == *slot_stats_tracking_complete* ]]; then
+            local rep recov drops color risk
+            rep=$(grep -o 'num_repaired=[0-9]*'          <<<"$line" | cut -d= -f2 || echo 0)
+            recov=$(grep -o 'num_recovered=[0-9]*'       <<<"$line" | cut -d= -f2 || echo 0)
+            drops=$(grep -o 'dropped_packets_count=[0-9]*' <<<"$line" | cut -d= -f2 || echo 0)
+
+            if   (( rep > 300 || drops > 200 )); then color="$C_RED"; risk="HIGH"
+            elif (( rep > 120 || drops > 80  )); then color="$C_YEL"; risk="MED"
+            else color="$C_GRN"; risk="LOW"; fi
+            printf '%bSLOT %-10s | Repairs %-5s | Drops %-5s | Recov %-5s | Risk %-4s | Leader %s%b\n' \
+                "$color" "$slot" "$rep" "$drops" "$recov" "$risk" "${last_leader:0:12}…" "$C_RST"
+        fi
+        [[ "$line" == *shred_fetch_repair* ]] && \
+            printf '   └─ Repair fetch → %s shreds\n' \
+                "$(grep -o 'shred_count=[0-9]*' <<<"$line" | cut -d= -f2)"
+        [[ "$line" == *retransmit-stage-slot-stats* ]] && {
+            local l1 l2
+            l1=$(grep -o 'num_shreds_received_1st_layer=[0-9]*' <<<"$line" | cut -d= -f2)
+            l2=$(grep -o 'num_shreds_received_2nd_layer=[0-9]*' <<<"$line" | cut -d= -f2)
+            printf '   └─ Turbine 1st/2nd → %s / %s\n' "$l1" "$l2"
+        }
+        [[ "$line" == *vote-processing-timing* ]] && {
+            local v
+            v=$(grep -o 'vote_txn_processing_us=[0-9]*' <<<"$line" | cut -d= -f2)
+            [[ -n "$v" ]] && printf '   └─ Vote latency → %s µs\n' "$v"
+        }
+        [[ "$line" == *banking_stage* ]] && \
+            printf '   └─ Banking stage event\n'
+    done
+}
+
+# ============================================================================
+#                              DISCOVER MODE
+# ============================================================================
+run_discover() {
+    local secs="${1:-60}"
+    init_state
+    echo "Tailing $SERVICE for ${secs}s, recording metric names…"
+    log_parser & local pid=$!
+    sleep "$secs"
+    kill "$pid" 2>/dev/null
+    echo
+    echo "Metric names seen (count, name) — use this to verify parser coverage:"
+    sort "$STATE_DIR/metrics_seen" | uniq -c | sort -rn
+}
+
+# ============================================================================
+#                              ALERTS MODE
+# ============================================================================
+run_alerts() {
+    init_state
+    log_parser    & BG_PIDS+=($!)
+    rpc_watcher   & BG_PIDS+=($!)
+    sys_collector & BG_PIDS+=($!)
+    nvme_collector & BG_PIDS+=($!)
+
+    local last_level="LOW"
+    while :; do
+        local r level score reasons
+        r=$(compute_risk)
+        score=$(cut -d'|' -f1 <<<"$r")
+        level=$(cut -d'|' -f2 <<<"$r")
+        reasons=$(cut -d'|' -f3 <<<"$r")
+        if [[ "$level" != "$last_level" ]]; then
+            local col; col=$(risk_color "$level")
+            printf '%s %b[%s]%b score=%s %s\n' \
+                "$(date '+%H:%M:%S')" "$col" "$level" "$C_RST" "$score" "$reasons"
+            last_level="$level"
+        fi
+        sleep 5
+    done
+}
+
+# ============================================================================
+#                              --docs MODE
+# Dumps the full metric reference to stdout. Sources METRICS.md if present,
+# falls back to a built-in compact version.
+# ============================================================================
+run_docs() {
+    local docs_file=""
+    for cand in \
+        "$SCRIPT_DIR/docs/METRICS.md" \
+        "$HOME/.local/share/x1-sentinel/docs/METRICS.md" \
+        "/usr/local/share/x1-sentinel/docs/METRICS.md"; do
+        if [[ -f "$cand" ]]; then docs_file="$cand"; break; fi
+    done
+    if [[ -n "$docs_file" ]]; then
+        if command -v less >/dev/null 2>&1; then
+            less -R "$docs_file"
+        else
+            cat "$docs_file"
+        fi
+        return
+    fi
+    cat <<'EOF'
+CAPYBARA METRIC REFERENCE (built-in fallback)
+=============================================
+
+For full documentation: https://github.com/Commoneffort/x1-sentinel
+
+PoH HEALTH
+  Tick rate    target ≥160/sec. Below 140 = CPU starved. <100 critical.
+  Tick CV      ≤5% healthy. >10% = thread preemption.
+  Lock avg     <2000µs healthy. >10000 = severe contention.
+
+POH SLOT FILL  (most predictive metric for skips)
+  Slot fill duration vs 400ms budget.
+  Healthy: <320ms. Critical: ≥400ms.
+
+SLOT REPLAY  (validating other leaders' slots)
+  Different from POH SLOT FILL. Spikes can be upstream pressure.
+
+BLOCK PRODUCTION  (your skip rate)
+  <0.5% excellent. 1-3% concerning. >3% bad.
+
+BANKING STAGE  (idle vs LEADING)
+  Drops only matter when LEADING.
+  Buffered >2000 = backpressure.
+
+TPU / QUIC
+  Active conns: 50-500. Throttled/s >10 = shedding.
+
+BLOCK LOAD
+  CU vs 48M cap. >90% saturated.
+
+ACCOUNTSDB
+  Store avg <100µs. Snapshot peak <2s good, >10s critical.
+
+SNAPSHOT STATE
+  Aggregate: idle / building / in-progress / active.
+  Auto-dampens timing alerts when active.
+
+SHREDS / TURBINE
+  Repairs <50 healthy. >200 = peering issue.
+
+SYSTEM
+  Load <50% × ncpu healthy. >75% CPU-bound.
+  Disk w_await <5ms excellent.
+
+PRECOGNITIVE RISK
+  LOW(0-25) MED(26-55) HIGH(56-90) CRIT(91+)
+  Telegram/Discord fires at HIGH+.
+
+For interactive help: press ? in the dashboard.
+For metric history:   x1-sentinel --history
+EOF
+}
+
+# ============================================================================
+#                              --history MODE
+# Reads the CSV written by daemon mode. Computes percentiles and trends.
+# ============================================================================
+HISTORY_DIR_DEFAULT="${HOME}/.local/share/x1-sentinel/history"
+HISTORY_FILE="${HISTORY_DIR:-$HISTORY_DIR_DEFAULT}/metrics.csv"
+
+run_history() {
+    local hours="${1:-24}"
+    if [[ ! -f "$HISTORY_FILE" ]]; then
+        printf '%bNo history file at %s%b\n' "$C_YEL" "$HISTORY_FILE" "$C_RST"
+        printf '%bRun "x1-sentinel --daemon" or enable the systemd service first.%b\n' \
+            "$C_DIM" "$C_RST"
+        printf '%bThe daemon writes one row per minute to that file.%b\n' "$C_DIM" "$C_RST"
+        return 1
+    fi
+
+    local cutoff; cutoff=$(date -d "$hours hours ago" +%s 2>/dev/null || echo 0)
+    local total
+    total=$(awk -F, -v c="$cutoff" '$1 > c' "$HISTORY_FILE" | wc -l)
+
+    if (( total < 1 )); then
+        printf '%bNo history rows in the last %s hours.%b\n' "$C_YEL" "$hours" "$C_RST"
+        return 1
+    fi
+
+    printf '%b═══ CAPYBARA HISTORY · last %s hours · %s rows ═══%b\n\n' \
+        "$C_BLD$C_CYN" "$hours" "$total" "$C_RST"
+
+    # CSV columns: ts,risk_score,poh_rate,poh_cv,slot_fill_avg,slot_fill_peak,
+    # block_drop_pct,bank_drop_pct,store_us,snap_peak,load1,disk_util,nvme_await
+    awk -F, -v c="$cutoff" -v cgrn="$C_GRN" -v cyel="$C_YEL" -v cred="$C_RED" \
+        -v cbld="$C_BLD" -v cdim="$C_DIM" -v crst="$C_RST" '
+    BEGIN { rows = 0 }
+    NR == 1 { next }   # skip header
+    $1 > c {
+        rows++
+        risk[rows] = $2; poh_rate[rows] = $3; poh_cv[rows] = $4
+        sf_avg[rows] = $5; sf_peak[rows] = $6
+        bd_life[rows] = $7; bd_recent[rows] = $8
+        store[rows] = $9; snap[rows] = $10
+        load1[rows] = $11; disk_util[rows] = $12; await[rows] = $13
+    }
+    function p50(arr, n,    i, vals) {
+        if (n == 0) return 0
+        for (i = 1; i <= n; i++) vals[i] = arr[i]
+        # sort
+        for (i = 1; i <= n; i++) for (j = i+1; j <= n; j++)
+            if (vals[i]+0 > vals[j]+0) { t=vals[i]; vals[i]=vals[j]; vals[j]=t }
+        return vals[int(n/2)+1]
+    }
+    function p95(arr, n,   i, vals) {
+        if (n == 0) return 0
+        for (i = 1; i <= n; i++) vals[i] = arr[i]
+        for (i = 1; i <= n; i++) for (j = i+1; j <= n; j++)
+            if (vals[i]+0 > vals[j]+0) { t=vals[i]; vals[i]=vals[j]; vals[j]=t }
+        return vals[int(n*0.95)+1]
+    }
+    function maxv(arr, n,   i, m) {
+        if (n == 0) return 0
+        m = arr[1]
+        for (i = 2; i <= n; i++) if (arr[i]+0 > m+0) m = arr[i]
+        return m
+    }
+    function color(v, w, c,    rev) {
+        if (rev == 1) {
+            if (v+0 < c+0) return cred
+            if (v+0 < w+0) return cyel
+        } else {
+            if (v+0 > c+0) return cred
+            if (v+0 > w+0) return cyel
+        }
+        return cgrn
+    }
+    END {
+        if (rows == 0) exit
+        printf "%sMetric                    median        p95         max%s\n", cbld, crst
+        printf "%s%s%s\n", cdim, "─────────────────────────────────────────────────────────────", crst
+
+        c = color(p50(risk, rows), 25, 55)
+        printf "Risk score              %s%6s%s     %6s     %6s\n", c, p50(risk, rows), crst, p95(risk, rows), maxv(risk, rows)
+
+        c = color(p50(poh_rate, rows), 140, 100, 1)
+        printf "PoH tick rate /s        %s%6s%s     %6s     %6s\n", c, p50(poh_rate, rows), crst, p95(poh_rate, rows), maxv(poh_rate, rows)
+
+        c = color(p50(sf_avg, rows), 320, 400)
+        printf "Slot fill avg ms        %s%6s%s     %6s     %6s\n", c, p50(sf_avg, rows), crst, p95(sf_avg, rows), maxv(sf_avg, rows)
+
+        c = color(maxv(sf_peak, rows), 1000, 2000)
+        printf "Slot fill peak ms       %s%6s%s     %6s     %6s\n", c, p50(sf_peak, rows), crst, p95(sf_peak, rows), maxv(sf_peak, rows)
+
+        c = color(p50(bd_recent, rows), 1.5, 4)
+        printf "Block drop %% recent     %s%6s%s     %6s     %6s\n", c, p50(bd_recent, rows), crst, p95(bd_recent, rows), maxv(bd_recent, rows)
+
+        c = color(p50(snap, rows), 2000, 10000)
+        printf "Snapshot peak ms        %s%6s%s     %6s     %6s\n", c, p50(snap, rows), crst, p95(snap, rows), maxv(snap, rows)
+
+        c = color(p50(load1, rows), 50, 75)
+        printf "Load1 (raw)             %s%6s%s     %6s     %6s\n", c, p50(load1, rows), crst, p95(load1, rows), maxv(load1, rows)
+
+        c = color(p50(disk_util, rows), 60, 85)
+        printf "Disk util %%             %s%6s%s     %6s     %6s\n", c, p50(disk_util, rows), crst, p95(disk_util, rows), maxv(disk_util, rows)
+    }
+    ' "$HISTORY_FILE"
+    echo
+    printf '%b%s rows · file: %s%b\n' "$C_DIM" "$total" "$HISTORY_FILE" "$C_RST"
+}
+
+# ============================================================================
+#                              --daemon MODE
+# Background-friendly: runs alerts AND writes CSV history every minute.
+# ============================================================================
+run_daemon() {
+    init_state
+    log_parser    & BG_PIDS+=($!)
+    rpc_watcher   & BG_PIDS+=($!)
+    sys_collector & BG_PIDS+=($!)
+    nvme_collector & BG_PIDS+=($!)
+
+    local hist_dir="${HISTORY_DIR:-$HISTORY_DIR_DEFAULT}"
+    mkdir -p "$hist_dir" 2>/dev/null
+    local hist_file="$hist_dir/metrics.csv"
+
+    # Write header if file is new
+    if [[ ! -s "$hist_file" ]]; then
+        echo "ts,risk_score,poh_rate,poh_cv,slot_fill_avg,slot_fill_peak,block_drop_life,block_drop_recent,store_us,snap_peak,load1,disk_util,nvme_await" \
+            > "$hist_file"
+    fi
+
+    printf '%bCAPYBARA daemon running · pid=%s · history=%s%b\n' \
+        "$C_GRN" "$$" "$hist_file" "$C_RST"
+    printf '%bWriting one row per minute. Risk transitions trigger alerts.%b\n' \
+        "$C_DIM" "$C_RST"
+
+    local last_level="LOW" last_write=0
+
+    while :; do
+        # Risk evaluation every 5s for alerts
+        local r level score reasons
+        r=$(compute_risk)
+        score=$(cut -d'|' -f1 <<<"$r")
+        level=$(cut -d'|' -f2 <<<"$r")
+        reasons=$(cut -d'|' -f3 <<<"$r")
+
+        if [[ "$level" != "$last_level" ]]; then
+            printf '%s [%s] score=%s %s\n' "$(date '+%H:%M:%S')" "$level" "$score" "$reasons"
+            if [[ "$level" == "HIGH" || "$level" == "CRIT" ]]; then
+                if declare -F alert_send >/dev/null; then
+                    alert_send "$level" "Risk → $level (score $score)" "$reasons"
+                fi
+            fi
+            last_level="$level"
+        fi
+
+        # Write history row every 60s
+        local now; now=$(date +%s)
+        if (( now - last_write >= 60 )); then
+            write_history_row "$hist_file" "$score"
+            last_write="$now"
+            # Retention: drop rows older than HISTORY_RETENTION_DAYS
+            local retain="${HISTORY_RETENTION_DAYS:-30}"
+            local cutoff; cutoff=$(date -d "$retain days ago" +%s 2>/dev/null || echo 0)
+            if (( cutoff > 0 )); then
+                local tmp="$hist_file.tmp"
+                head -1 "$hist_file" > "$tmp"
+                awk -F, -v c="$cutoff" 'NR > 1 && $1 > c' "$hist_file" >> "$tmp"
+                mv "$tmp" "$hist_file"
+            fi
+        fi
+
+        sleep 5
+    done
+}
+
+write_history_row() {
+    local file="$1" risk_score="$2"
+    local now; now=$(date +%s)
+    local poh_rate poh_cv sf_avg sf_peak bd_life bd_recent store snap load1 disk_util await
+
+    # Reuse the same compute paths as the dashboard
+    if (( $(wc -l < "$STATE_DIR/poh_service" 2>/dev/null || echo 0) >= 2 )); then
+        poh_rate=$(awk -v now="$(date +%s.%3N)" -v win=60 '
+            { if (now-$1 <= win) { sum+=$2; if (firstts=="") firstts=$1; lastts=$1 } }
+            END { dt=lastts-firstts; if (dt>0) printf "%.1f", sum/dt; else print "0" }
+        ' "$STATE_DIR/poh_service")
+        poh_cv=$(awk -v now="$(date +%s.%3N)" -v win=60 '
+            { if (now-$1 <= win) { vals[++n]=$2; sum+=$2 } }
+            END { if (n<2) {print "0"; exit}
+                  m=sum/n
+                  for (i=1;i<=n;i++) ss+=(vals[i]-m)^2
+                  sd=sqrt(ss/n)
+                  if (m>0) printf "%.1f", 100*sd/m
+                  else print "0" }
+        ' "$STATE_DIR/poh_service")
+    else
+        poh_rate=0; poh_cv=0
+    fi
+
+    sf_avg=$(avg_recent "$STATE_DIR/poh_slot_timing" 60 1)
+    sf_peak=$(max_recent "$STATE_DIR/poh_slot_timing" 60 1)
+
+    # Block drop rates
+    bd_life=0; bd_recent=0
+    if (( $(wc -l < "$STATE_DIR/blocks_produced" 2>/dev/null || echo 0) >= 2 )); then
+        local lp ld fp fd
+        read -r _ lp ld < <(tail -1 "$STATE_DIR/blocks_produced")
+        read -r _ fp fd < <(head -1 "$STATE_DIR/blocks_produced")
+        if awk -v p="$lp" -v d="$ld" 'BEGIN{exit !(p+d > 0)}'; then
+            bd_life=$(awk -v p="$lp" -v d="$ld" 'BEGIN{printf "%.2f", 100*d/(p+d)}')
+        fi
+        local dp=$((lp-fp)) dd=$((ld-fd))
+        if awk -v p="$dp" -v d="$dd" 'BEGIN{exit !(p+d > 0)}'; then
+            bd_recent=$(awk -v p="$dp" -v d="$dd" 'BEGIN{printf "%.2f", 100*d/(p+d)}')
+        fi
+    fi
+
+    store=$(avg_recent "$STATE_DIR/accounts_store" 60 1)
+    snap=$(max_recent  "$STATE_DIR/snapshots" 300 1)
+    snap=$((snap/1000))
+
+    load1=0
+    if [[ -s "$STATE_DIR/loadavg" ]]; then
+        load1=$(awk -F'[= ]' '{for(i=1;i<=NF;i++)if($i=="load1"){print $(i+1);exit}}' \
+            "$STATE_DIR/loadavg")
+    fi
+
+    disk_util=0; await=0
+    if [[ -s "$STATE_DIR/nvme_io" ]]; then
+        disk_util=$(grep -oE 'util=[0-9.]+' "$STATE_DIR/nvme_io" | head -1 | cut -d= -f2)
+        await=$(grep -oE 'w_await=[0-9.]+' "$STATE_DIR/nvme_io" | head -1 | cut -d= -f2)
+        disk_util=${disk_util:-0}; await=${await:-0}
+    fi
+
+    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+        "$now" "$risk_score" "$poh_rate" "$poh_cv" \
+        "${sf_avg:-0}" "${sf_peak:-0}" "$bd_life" "$bd_recent" \
+        "${store:-0}" "$snap" "$load1" "$disk_util" "$await" \
+        >> "$file"
+}
+
+# ============================================================================
+#                              DISPATCH
+# ============================================================================
+case "${1:-}" in
+    --stream)        run_stream ;;
+    --discover)      run_discover "${2:-60}" ;;
+    --list-metrics)  run_list_metrics "${2:-90}" ;;
+    --alerts)        run_alerts ;;
+    --daemon)        run_daemon ;;
+    --history)       run_history "${2:-24}" ;;
+    --docs)          run_docs ;;
+    --version|-v)    echo "capybara v0.2.0" ;;
+    -h|--help)
+        cat <<EOF
+${C_BLD}CAPYBARA${C_RST} — precognitive validator monitoring for X1
+  https://github.com/Commoneffort/x1-sentinel
+
+USAGE
+  x1-sentinel               Interactive dashboard (default)
+  x1-sentinel --alerts      Quiet mode, only logs risk transitions
+  x1-sentinel --daemon      Background mode: alerts + writes CSV history
+  x1-sentinel --history [h] Show summary of last [h] hours (default 24)
+  x1-sentinel --docs        Open the metric reference manual
+  x1-sentinel --stream      v10-style raw event stream
+  x1-sentinel --discover N  Tail journal for N seconds, list metric names
+  x1-sentinel --list-metrics N  Same as --discover but with field samples
+  x1-sentinel --version     Print version
+  x1-sentinel --help        This message
+
+DASHBOARD KEYS
+  q   quit
+  h   toggle inline help (per-panel descriptions appear next to values)
+  ?   full help overlay
+  d   open docs in less
+EOF
+        ;;
+    *)               run_dashboard ;;
+esac

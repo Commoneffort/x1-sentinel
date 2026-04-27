@@ -1,0 +1,51 @@
+# =============================================================================
+# x1-sentinel configuration
+# =============================================================================
+# Lines starting with # are comments. All values are optional — unset means
+# auto-detect or use defaults. Run: x1-sentinel --self-check  to validate.
+
+# ---- Validator identity ----
+# Either set PUBKEY directly (skips solana-keygen call) or IDENTITY (file path)
+PUBKEY=
+# IDENTITY=/home/USER/.config/solana/identity.json
+
+# ---- Service ----
+# systemd unit name. Auto-detected if not set.
+# SERVICE=solana-validator.service
+
+# ---- RPC endpoints ----
+# Local validator RPC. Default: http://localhost:8899
+RPC_URL=http://localhost:8899
+# Cluster RPC for slot drift comparison. Auto-detected from --entrypoint if possible.
+# Examples:
+#   X1 mainnet:    https://rpc.mainnet.x1.xyz
+#   X1 testnet:    https://rpc.testnet.x1.xyz
+#   Solana mainnet: https://api.mainnet-beta.solana.com
+CLUSTER_RPC=https://rpc.mainnet.x1.xyz
+
+# ---- Hardware ----
+# NVMe device for IO monitoring. Auto-detected from root mount.
+# NVME_DEV=md1
+
+# ---- Tuning ----
+# Slot budget in milliseconds. Default: 400 (X1 and Solana standard).
+BUDGET_MS=400
+# Dashboard refresh interval in seconds.
+REFRESH=1
+
+# ---- Alerts ----
+# Telegram (get token from @BotFather, chat ID from @userinfobot)
+TG_TOKEN=
+TG_CHAT=
+# Discord webhook URL
+DISCORD_WEBHOOK=
+# Generic webhook (POSTs JSON: {host, level, title, body, timestamp})
+WEBHOOK_URL=
+# Minimum seconds between alerts of the same type (default: 300 = 5 min)
+ALERT_RATE_LIMIT_SEC=300
+
+# ---- Daemon / history ----
+# Where to store CSV metric history (only used in daemon mode)
+HISTORY_DIR=
+# How many days of history to keep
+HISTORY_RETENTION_DAYS=30
